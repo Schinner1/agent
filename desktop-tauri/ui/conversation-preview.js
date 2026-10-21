@@ -1,5 +1,5 @@
 /* Agent2API · 「预览对话」的纯渲染（请求 / 响应原文 → 对话气泡 HTML） */
-/* global wbApp, wbMarkdown */
+/* global wbApp, wbI18n, wbMarkdown */
 
 /**
  * 请求详情弹窗「预览对话」那一块的全部渲染逻辑：把后端 `GET
@@ -7,7 +7,7 @@
  * 解析并还原成一轮对话。
  *
  * ── 为什么单独成文件 ──────────────────────────────────────────
- * 与 request-detail.js 按职责拆开（那个文件管弹窗与数据获取，本项目约定
+ * 与 islands/request-detail.tsx 按职责拆开（那个文件管弹窗与数据获取，本项目约定
  * 单文件不过 800 行）。本文件是**纯函数**：输入两个字符串、输出 HTML 字符串，
  * 不碰 DOM、不发请求、没有状态 —— 解析容错是这里最大的一块内容（SSE 逐帧
  * 拼装、多协议 content 数组、一段原文解析不了时的降级链），混在弹窗的状态
@@ -70,7 +70,7 @@
   function imgHtml(url, alt) {
     const src = safeImgSrc(url);
     if (!src) return '';
-    return `<img class="cv-img" src="${esc(src)}" alt="${esc(alt || '图片')}" loading="lazy">`;
+    return `<img class="cv-img" src="${esc(src)}" alt="${esc(alt || wbI18n.t('图片'))}" loading="lazy">`;
   }
 
   /** `arguments` 常是 JSON 文本：能解析就缩进展示，解析不了原样（不猜格式） */
@@ -125,7 +125,7 @@
         out.calls.push({ name: String(part.name || 'tool'), args: prettyJson(JSON.stringify(part.input ?? {})) });
       } else if (type === 'tool_result') {
         const result = collectContent(part.content, { text: '', images: [], calls: [], results: [], thinking: '' });
-        out.results.push({ label: part.tool_use_id ? `工具结果 · ${part.tool_use_id}` : '工具结果', text: result.text });
+        out.results.push({ label: part.tool_use_id ? wbI18n.t('工具结果 · {id}', { id: part.tool_use_id }) : wbI18n.t('工具结果'), text: result.text });
       } else if (type === 'thinking' && typeof part.thinking === 'string') {
         out.thinking.push(part.thinking);
       }
@@ -171,7 +171,7 @@
     }
     if (role === 'tool') {
       if (!parts.text && !parts.images.length) return '';
-      const label = message.tool_call_id ? `工具结果 · ${esc(String(message.tool_call_id))}` : '工具结果';
+      const label = message.tool_call_id ? wbI18n.t('工具结果 · {id}', { id: esc(String(message.tool_call_id)) }) : wbI18n.t('工具结果');
       return toolDetailsHtml(label, parts);
     }
     // user（与未知角色）：纯文本 + 图片。**不做 markdown** —— 主色底上的
@@ -184,7 +184,7 @@
   /** 用户气泡：文本原样（转义）+ 图片行 */
   function userInner(parts) {
     const text = parts.text ? `<div class="cv-plain">${esc(parts.text)}</div>` : '';
-    const images = parts.images.map(url => imgHtml(url, '请求图片')).join('');
+    const images = parts.images.map(url => imgHtml(url, wbI18n.t('请求图片'))).join('');
     return text + images;
   }
 
@@ -200,7 +200,7 @@
   function reasoningsHtml(reasoning) {
     const text = String(reasoning ?? '').trim();
     if (!text) return '';
-    return `<details class="cv-details"><summary>思考过程</summary>`
+    return `<details class="cv-details">${wbI18n.t('<summary>思考过程</summary>')}`
       + `<div class="cv-reasoning md-body">${richText(text)}</div></details>`;
   }
 
@@ -208,13 +208,13 @@
   function callHtml(call) {
     const name = String(call?.name || 'tool');
     const args = String(call?.args ?? '');
-    return `<div class="cv-toolcall"><div class="cv-toolcall-name">调用工具 <code class="md-code">${esc(name)}</code></div>`
+    return '<div class="cv-toolcall">' + wbI18n.t('<div class="cv-toolcall-name">调用工具 <code class="md-code">{name}</code></div>', { name: esc(name) })
       + (args ? `<pre class="req-detail-pre cv-pre">${esc(args)}</pre>` : '') + '</div>';
   }
 
   /** 工具结果折叠块（label 需要是已转义文本） */
   function toolDetailsHtml(label, parts) {
-    const images = (parts.images || []).map(url => imgHtml(url, '工具结果图片')).join('');
+    const images = (parts.images || []).map(url => imgHtml(url, wbI18n.t('工具结果图片'))).join('');
     const body = (parts.text ? `<div class="cv-plain">${esc(parts.text)}</div>` : '') + images;
     if (!body) return '';
     return `<details class="cv-tool"><summary>${label}</summary>${body}</details>`;
@@ -247,9 +247,23 @@
       const filled = blocks.filter(Boolean);
       if (filled.length) return filled.join('');
     }
+    if (isPlainObject(body) && body.input !== undefined) {
+      // OpenAI Responses 请求体：instructions 对应 system，input 可为字符串或消息数组
+      const blocks = [];
+      if (typeof body.instructions === 'string' && body.instructions.trim()) {
+        blocks.push(`<div class="cv-row sys"><div class="cv-msg sys md-body">${richText(body.instructions)}</div></div>`);
+      }
+      if (typeof body.input === 'string' && body.input.trim()) {
+        blocks.push(messageHtml({ role: 'user', content: body.input }));
+      } else if (Array.isArray(body.input)) {
+        for (const item of body.input) blocks.push(messageHtml(item));
+      }
+      const filled = blocks.filter(Boolean);
+      if (filled.length) return filled.join('');
+    }
     // 降级：不是 JSON / 没有 messages / 消息全空 —— 说清为什么，并保留原文
-    return `<div class="cv-parse-empty">无法解析请求体（不是含 messages 数组的 JSON）</div>`
-      + `<details class="cv-details"><summary>请求原文</summary><pre class="req-detail-pre">${esc(source)}</pre></details>`;
+    return wbI18n.t('<div class="cv-parse-empty">无法解析请求体（不是含 messages 数组的 JSON）</div>')
+      + `<details class="cv-details">${wbI18n.t('<summary>请求原文</summary>')}<pre class="req-detail-pre">${esc(source)}</pre></details>`;
   }
 
   // ─── 响应侧：SSE / JSON → 助手气泡 ────────────
@@ -332,7 +346,43 @@
     if (!isPlainObject(body)) return null;
     if (body.error) {
       const message = isPlainObject(body.error) ? body.error.message : body.error;
-      return { errorText: String(message ?? '上游返回错误') };
+      return { errorText: String(message ?? wbI18n.t('上游返回错误')) };
+    }
+    if (Array.isArray(body.output)) {
+      // OpenAI Responses 响应体：output 数组含 reasoning / message / function_call 项
+      const parts = newParts();
+      let reasoning = '';
+      for (const item of body.output) {
+        if (!isPlainObject(item)) continue;
+        if (item.type === 'reasoning' && Array.isArray(item.summary)) {
+          for (const piece of item.summary) {
+            if (isPlainObject(piece) && typeof piece.text === 'string' && piece.text) {
+              reasoning += (reasoning ? '\n' : '') + piece.text;
+            }
+          }
+        } else if (item.type === 'message' && Array.isArray(item.content)) {
+          for (const piece of item.content) {
+            if (isPlainObject(piece) && typeof piece.text === 'string' && piece.text) {
+              parts.text += (parts.text ? '\n' : '') + piece.text;
+            }
+          }
+        } else if (item.type === 'function_call' || item.type === 'custom_tool_call') {
+          parts.calls.push({
+            name: String(item.name || 'tool'),
+            args: prettyJson(item.arguments ?? item.input ?? ''),
+          });
+        }
+      }
+      if (!parts.text && typeof body.output_text === 'string') parts.text = body.output_text;
+      if (!parts.text && !parts.calls.length && !reasoning) return null;
+      return { text: parts.text, images: [], reasoning, calls: parts.calls, errorText: '' };
+    }
+    if (body.type === 'message' && Array.isArray(body.content)) {
+      // Anthropic Messages 响应体：content 块数组含 thinking / text / tool_use
+      const parts = collectContent(body.content, newParts());
+      const reasoning = Array.isArray(parts.thinking) ? parts.thinking.join('\n') : String(parts.thinking || '');
+      if (!parts.text && !parts.images.length && !parts.calls.length && !reasoning) return null;
+      return { text: parts.text, images: parts.images, reasoning, calls: parts.calls, errorText: '' };
     }
     const choice = Array.isArray(body.choices) ? body.choices[0] : null;
     const message = isPlainObject(choice) ? choice.message : null;
@@ -376,8 +426,8 @@
     }
     // 降级：解析不出内容（或解析成功但内容全空）→ 原文折叠。
     // 这一档不是错误，是「格式没认出来，但原文还在」。
-    return `<div class="cv-parse-empty">无法解析响应内容</div>`
-      + `<details class="cv-details"><summary>响应原文</summary><pre class="req-detail-pre">${esc(source)}</pre></details>`;
+    return wbI18n.t('<div class="cv-parse-empty">无法解析响应内容</div>')
+      + `<details class="cv-details">${wbI18n.t('<summary>响应原文</summary>')}<pre class="req-detail-pre">${esc(source)}</pre></details>`;
   }
 
   // ─── 对外入口 ────────────────────────────────
@@ -394,8 +444,8 @@
     const response = String(responseBody ?? '');
     if (!request.trim() && !response.trim()) return '';
     const blocks = [
-      requestHtml(request) || (response.trim() ? '<div class="cv-parse-empty">无请求原文</div>' : ''),
-      responseHtml(response) || (request.trim() ? '<div class="cv-parse-empty">无响应原文</div>' : ''),
+      requestHtml(request) || (response.trim() ? wbI18n.t('<div class="cv-parse-empty">无请求原文</div>') : ''),
+      responseHtml(response) || (request.trim() ? wbI18n.t('<div class="cv-parse-empty">无响应原文</div>') : ''),
     ];
     return `<div class="cv">${blocks.join('')}</div>`;
   }

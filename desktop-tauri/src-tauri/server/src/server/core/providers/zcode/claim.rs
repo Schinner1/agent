@@ -1,32 +1,41 @@
-//! ZCode 的**周末套餐领取**（manual claim / weekend plan）。
+//! ZCode 的**限时套餐领取**（manual claim / start plan）。
 //!
 //! ── 这个功能替代了本家的「签到」────────────────────────────
 //! 其余各家都有每日签到（`core::auto_checkin` 的提供商清单），ZCode 没有签到
-//! 活动 —— 它的运营玩法是**限时发放的体验套餐**（周末套餐 / start-plan），
-//! 用户在客户端里点一下就领，领到的额度在一段时间内可用。因此本家接进定时
-//! 任务框架的是「领取」而不是「签到」，两者的调度形状相同、协议完全不同。
+//! 活动 —— 它的运营玩法是**限时发放的体验套餐**（周末套餐 / Global Build /
+//! ZCode Trust Build），用户在客户端里点一下就领，领到的额度在一段时间内可用。
 //!
-//! ── 上游协议（两个接口，抄自 ZCode 3.12.3 客户端）────────────
-//! 参考实现：`Acankao/zcode-api` 的 `src/claim/client.ts`，本模块是它的移植。
+//! ── 「每天领一次」是**套餐 id 实现的**，不是上游的每日签到 ────
+//! 2026-09-28 那期（ZCode Trust Build，9/28–11/7）公告写的是「每天登录领 1 亿」，
+//! 而上游没有单独的「每日领取」接口：`preview` 每天返回一个**带日期段的新套餐**
+//! （`zcode-v3-start-plan-trust-0928` → `…-0929`），于是「今天领过没」等价于
+//! 「今天这个 plan_id 领过没」（同一期再领回 `1003 already claimed`）。
+//! 本家的界面据此按自然日落一次状态（`claimAt`），见
+//! `core::account_store::StoredAccount::claim_at`。
+//!
+//! ── 上游协议（两个接口，抄自 ZCode 客户端的 `manualClaimPlan`）──
+//! 参考实现：`Acankao/zcode-api` 的 `src/claim/client.ts`，本模块是它的移植；
+//! 字段与失败语义另有官方仓库（`zai-org/ZCode`）可对照。
 //!
 //! ```text
 //!   探测  GET  {zcode}/api/v1/zcode-plan/billing/preview?app_version=&platform=
 //!   领取  POST {zcode}/api/v1/zcode-plan/billing/claim   body {"plan_id": "..."}
 //! ```
 //!
-//! ── 头集合是「极简 + 两处例外」，别照抄别家 ──────────────────
-//! preview 只带 `Authorization: Bearer {jwt}`（匿名时**一个头都不带**）；
-//! claim 带 Authorization / Content-Type / 验证码参数 / 版本 / 平台。
-//! 参考实现为此留了一条很长的注记：3.12.3 的客户端就是极简集合，早先版本
-//! 发过整套身份头（`X-Device-Mid` 等），两者在不同活动期都出现过。
+//! ── 头集合是「极简 + 一处硬要求」─────────────────────────────
+//! preview 与 claim 都只必要地带 `Authorization: Bearer {jwt}`（探测允许匿名），
+//! claim 另加 Content-Type 与验证码参数。早先版本发过整套身份头（`X-Device-Mid`
+//! 等），两者在不同活动期都出现过。
 //!
-//! **一处必须保留的例外**：`X-Device-Mid`（UUID 形态）。参考实现实测记录：
-//! 2026-09-18 那一期活动，极简头会被网关以 biz 3001「参数错误」拒掉，
-//! 加上这个头立刻 200；只加验证码头无效。因此当调用方提供了 device_mid 时，
-//! **两个接口都要追加它**（位置在最后，与客户端的身份头顺序一致）。
+//! **`X-Device-Mid` 现在是硬要求**（2026-09-28 实测）：缺它、或值不是 UUID 形态，
+//! 网关一律回 `400 {"code":3001,"msg":"parameter error"}` —— 连**匿名探测**也一样
+//! （只带版本头/平台头都不管用，只加验证码头也无效）。设备标识还必须**跨请求
+//! 稳定**（风控据此关联同一设备的请求），因此它随凭证落盘、缺失时由
+//! `AccountStore::zcode_device_mid_or_create` 生成一次后长期复用，
+//! **不要**在调用点现编一个。
 //!
 //! ── 验证码为什么是**参数**而不是本模块自己求解 ───────────────
-//! claim 必须带 `X-Aliyun-Captcha-Verify-Param`（阿里云无痕验证）。
+//! claim 通常要带 `X-Aliyun-Captcha-Verify-Param`（阿里云无痕验证）。
 //! 参考实现在进程内用 happy-dom 跑阿里云官方混淆 SDK 求解 —— 那是 Node/Bun
 //! 生态的产物（需要 DOM 桩、canvas/WebGL/Worker 垫片、同步 XHR 的 worker 变通），
 //! 本网关是纯 Rust 且零 Node 依赖，**不重复实现那套求解器**。
@@ -36,6 +45,8 @@
 //! 后端**（见 `ui/autoclaw-oauth.js` 与 `api::session::login_oauth_captcha_config`）。
 //! 领取走同一条路：前端解出参数 → 调后端的领取接口 → 本模块把它原样转发给上游。
 //! 于是本模块的签名里 `captcha` 是**入参**，本模块只负责「带上它去领取」。
+//! 代价是**领取无法全自动**：定时任务里没有可用的验证码，这一点在
+//! `api::zcode_claim` 的模块头有说明（所以不接自动领取）。
 //!
 //! ── 失败分类（biz code → 语义）──────────────────────────────
 //! 与客户端 `$vt` 映射器逐条对齐（参考实现 `src/claim/types.ts`）：
@@ -101,6 +112,20 @@ pub struct CaptchaConfig {
     pub scene_id: String,
     /// SDK 站点地区（`window.AliyunCaptchaConfig.region`）
     pub region: String,
+    /// 上游说**推理请求**可以不带验证码头（`configs.captcha.skip_model_request`）。
+    ///
+    /// 2026-10-01 16:44 UTC 实测：`{"enabled":true,"prefix":"no8xfe","region":"cn",
+    /// "sceneId":"11xygtvd","skip_model_request":true}` —— 四个组合（app_version
+    /// 3.14.0 / 3.14.4 × platform darwin-arm64 / linux-x64）返回**逐字相同**，
+    /// 也就是说这一格与客户端版本无关，是服务端下发的开关。
+    ///
+    /// `enabled` 与它是**两件事**：前者管领取/登录这类交互流程还要不要滑块，
+    /// 后者只管 `…/anthropic/v1/messages` 那条推理路。因此不能拿 `enabled`
+    /// 推断推理免码 —— 那样会在上游把这一格翻回 `false` 时继续白铸令牌。
+    ///
+    /// 缺这一格按 `false` 收（照旧要码）：本家此前的全部行为都建立在「每条
+    /// 请求都要一枚令牌」上，把「没下发」读成「免码」等于让一次配置缺失误开门。
+    pub skip_model_request: bool,
 }
 
 /// 取风控配置（`GET {zcode}/api/v1/client/configs?app_version=&platform=`）。
@@ -128,13 +153,23 @@ pub async fn captcha_config(
             }
         })?;
     let payload = response.payload.unwrap_or(Value::Null);
+    Ok(parse_captcha_config(&payload))
+}
+
+/// 从 `GET /api/v1/client/configs` 的**整份响应**里读出 captcha 段（纯函数）。
+///
+/// 单独成函数的理由：这条链上只有这一处需要「上游那份 JSON 长什么样」的知识，
+/// 收成纯函数后，测试可以直接喂一份抓下来的真实响应（见 `captcha_config` 的
+/// 测试模块），而不必起一台假服务器 —— 而 `skip_model_request` 这一格恰恰是
+/// 整套免码判定的唯一依据，它必须钉在**实测过的字节**上。
+///
+/// 返回 `None` = 没有 captcha 段、或 SDK 必填的两格（`prefix` / `sceneId`）缺
+/// 任一（那时前端连初始化都做不出来，见调用方说明）。
+pub(super) fn parse_captcha_config(payload: &Value) -> Option<CaptchaConfig> {
     let captcha = payload
         .get("data")
         .and_then(|value| value.get("configs"))
-        .and_then(|value| value.get("captcha"));
-    let Some(captcha) = captcha else {
-        return Ok(None);
-    };
+        .and_then(|value| value.get("captcha"))?;
     let text = |key: &str| {
         captcha
             .get(key)
@@ -146,9 +181,9 @@ pub async fn captcha_config(
     let prefix = text("prefix");
     let scene_id = text("sceneId");
     if prefix.is_empty() || scene_id.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(CaptchaConfig {
+    Some(CaptchaConfig {
         enabled: captcha.get("enabled").and_then(Value::as_bool).unwrap_or(true),
         prefix,
         scene_id,
@@ -157,7 +192,13 @@ pub async fn captcha_config(
             let value = text("region");
             if value.is_empty() { "ga".to_string() } else { value }
         },
-    }))
+        // **缺这一格 = 要码**（见字段说明：宁可白铸一枚令牌，不要发一个
+        // 上游可能拒的无头请求 —— 3007 那次往返是要付账号行为分的）
+        skip_model_request: captcha
+            .get("skip_model_request")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 /// 领取出错时**优先复核风控配置**（模块头第 3007 档的处置，见 `claim` 的文档）。
@@ -210,6 +251,23 @@ pub fn platform() -> &'static str {
     }
 }
 
+/// 操作系统的**类别名**（`windows` / `macos` / `linux`）。
+///
+/// 客户端身份头 `X-Os-Category` 与激活事件体的 `device_os_category` 共用
+/// 这一处（两处各写一份 cfg 链，迟早有一处漏改）。与 [`platform`] 的区别：
+/// 那个是「平台-架构」（`win32-x64`），这个是纯类别名 —— 上游按它分流、
+/// 不看架构。认不出的平台落 `linux`（参考实现 `normalizeOsCategory` 的
+/// 默认分支同义）。
+pub fn os_category() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
 /// 一条可领取的套餐（上游 `plans[]` 的归一形态）。
 ///
 /// 字段保留上游语义：`starts_at` / `ends_at` 是 **unix 秒**（不是毫秒）——
@@ -225,7 +283,7 @@ pub struct ClaimablePlan {
     pub description: String,
     /// 优先级（同一批多个套餐时，取最大的那个）
     pub priority: i64,
-    /// 生效时间（unix 秒；周末套餐常常是「先领、稍后生效」，因此可能缺失）
+    /// 生效时间（unix 秒；有些期次的活动套餐是「先领、稍后生效」，因此可能缺失）
     pub starts_at: Option<i64>,
     /// 失效时间（unix 秒）
     pub ends_at: Option<i64>,
@@ -242,6 +300,12 @@ pub struct PlanEntitlement {
     pub unit_type: String,
     /// 授予量（`0` = 上游没给数字）
     pub grant_units: i64,
+    /// 周期（`one_time` = 一次性发放，`daily` = 每天续发）。
+    ///
+    /// 界面拿它区分「活动送的一次性额度」与「每日额度」（Start Plan 的两条权益
+    /// 就是 `daily`）—— 2026-09-28 那期 Trust Build 是一次性 1 亿，
+    /// 每天一个新套餐，所以两者都可能在同一天出现。
+    pub period: String,
     /// 生效时间（unix 秒；缺失表示随套餐立即生效）
     pub effective_at: Option<i64>,
 }
@@ -250,14 +314,14 @@ pub struct PlanEntitlement {
 ///
 /// ── 为什么 404 要单独成一档（这是最容易漏的一处）─────────────
 /// 参考实现在 `scheduler.ts` 里明确写着：**404 是「活动还没上线」的正常状态**
-/// （周末套餐开抢前，活动接口尚未部署），要按**正常节奏**轮询而不是走错误退避。
+/// （活动开抢前，接口尚未部署），要按**正常节奏**轮询而不是走错误退避。
 /// 若把 404 当失败处理，退避会让轮询节奏越来越慢，恰好错过开抢那一刻 ——
 /// 这个功能的价值全在「上新瞬间抢到」，慢一拍就没意义了。
 #[derive(Clone, Debug)]
 pub enum PreviewOutcome {
     /// 拿到了可领取的套餐（可能是空列表：接口通了但当前没有可领的）
     Plans(Vec<ClaimablePlan>),
-    /// 404：活动接口尚未部署（周末套餐开抢前的预期状态）
+    /// 404：活动接口尚未部署（开抢前的预期状态）
     NotDeployed,
 }
 
@@ -391,9 +455,15 @@ pub fn outcome_hold(outcome: &ClaimOutcome) -> NextAttempt {
 
 /// 探测当前可领取的套餐。
 ///
-/// `jwt` 为空时按上游语义发**匿名探测**（参考实现：匿名 preview 一个头都不带）。
+/// `jwt` 为空时按上游语义发**匿名探测**（参考实现：匿名 preview 不带头）。
 /// 匿名也能看到「有没有活动」，因此调度可以在登录态失效时继续探测；
 /// 但真正领取必须有 JWT（见 [`claim`]）。
+///
+/// `device_mid` **事实上是必需的**（2026-09-28 起上游这么要求，见模块头）：
+/// 调用方（`api::zcode_claim`）保证传进来的一定是 UUID 形态的稳定标识，
+/// 这里只在真的没有时才省略那个头 —— 那种情况会稳定拿到 3001，
+/// 而那正是「谁漏了这一步」的信号，不该由本函数偷偷补一个随机值（现编的值
+/// 每次都不一样，风控看到的是「同一个账号天天换设备」）。
 pub async fn preview(
     region: Region,
     jwt: &str,
@@ -608,7 +678,16 @@ fn parse_plan(raw: &Value) -> Option<ClaimablePlan> {
                             .trim()
                             .to_string(),
                         grant_units: item.get("grant_units").and_then(Value::as_i64).unwrap_or(0),
-                        effective_at: item.get("effective_at").and_then(Value::as_i64),
+                        period: item
+                            .get("period")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                        // 生效时间（unix 秒）：品类同 [`unix_seconds_of`]。
+                        // `0` 是官方文档里的「立即生效」哨兵值，原样带出 —— 判定在
+                        // 余额侧（`balance::plan_effective_times` 只收 > 0 的）
+                        effective_at: item.get("effective_at").and_then(unix_seconds_of),
                     })
                 })
                 .collect()
@@ -624,10 +703,25 @@ fn parse_plan(raw: &Value) -> Option<ClaimablePlan> {
             .trim()
             .to_string(),
         priority: raw.get("priority").and_then(Value::as_i64).unwrap_or(0),
-        starts_at: raw.get("starts_at").and_then(Value::as_i64),
-        ends_at: raw.get("ends_at").and_then(Value::as_i64),
+        starts_at: raw.get("starts_at").and_then(unix_seconds_of),
+        ends_at: raw.get("ends_at").and_then(unix_seconds_of),
         entitlements,
     })
+}
+
+/// 一个 unix 秒字段 → `i64`。
+///
+/// 上游这几个时间字段的官方类型是 `number | string | null`
+/// （`ZaiStartPlanPlan` / `entitlements[].effective_at` 在官方源码里就是这么写的），
+/// 只看 `as_i64` 会让**字符串形态**整条消失 —— 生效时间一丢，界面就退回
+/// 「按领取时间 / 立即生效」猜，那正是「生效时间显示成领取时间」那类 bug 的来源。
+/// 与余额侧的 `number_of` 同一条取值口径。
+fn unix_seconds_of(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
 }
 
 /// 从一批可领套餐里挑出目标：指定了 `plan_id` 就取它，否则取优先级最高的。
@@ -670,4 +764,75 @@ pub(super) fn urlencode(value: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod captcha_config_vectors {
+    //! `configs.captcha` 的解析，钉在**抓下来的真实响应**上。
+    //!
+    //! 这一格现在是整套免码判定的唯一依据（`skip_model_request`），而它的形状
+    //! 只有上游能告诉我们 —— 手写一份"想象中的响应"等于把猜测当证据。
+    //! 载荷出处：2026-10-01 16:44 UTC 从 `https://zcode.z.ai/api/v1/client/configs`
+    //! 抓的 captcha 段，四个组合（app_version 3.14.0/3.14.4 × platform
+    //! darwin-arm64/linux-x64）返回逐字相同，所以这里只需一份。
+
+    use serde_json::json;
+
+    use super::parse_captcha_config;
+
+    #[test]
+    fn the_live_captcha_segment_parses_as_captured() {
+        let config = parse_captcha_config(&json!({
+            "code": 0,
+            "msg": "",
+            "data": {"configs": {"captcha": {
+                "enabled": true, "prefix": "no8xfe", "region": "cn",
+                "sceneId": "11xygtvd", "skip_model_request": true
+            }}}
+        }))
+        .expect("这份响应是上游真实给过的");
+        assert!(
+            config.enabled,
+            "领取那条路仍然要滑块 —— 它和推理免码是两件事"
+        );
+        assert_eq!("no8xfe", config.prefix);
+        assert_eq!("11xygtvd", config.scene_id);
+        assert_eq!("cn", config.region, "站点地区上游给了就别自己兜底成 ga");
+        assert!(
+            config.skip_model_request,
+            "这一格是免码上线的全部依据，不能被解析成 false"
+        );
+    }
+
+    #[test]
+    fn an_absent_skip_flag_still_requires_a_token() {
+        // 缺 `skip_model_request`（上游还没下发这一格）= 照旧要码。
+        // 判反了的代价不对称：免码判错每条请求撞一次 3007（烧账号行为分），
+        // 要码判错只是白铸一枚令牌。
+        let config = parse_captcha_config(&json!({
+            "data": {"configs": {"captcha": {
+                "enabled": true, "prefix": "no8xfe", "sceneId": "11xygtvd"
+            }}}
+        }))
+        .expect("prefix 与 sceneId 齐了就认这份配置");
+        assert!(!config.skip_model_request);
+        assert_eq!(
+            "ga", config.region,
+            "没给 region 时的兜底（阿里云默认站点）"
+        );
+    }
+
+    #[test]
+    fn an_incomplete_segment_is_not_a_config_at_all() {
+        // 缺 sceneId 时前端连 SDK 都初始化不出来 —— 按「没有配置」处理，
+        // 而不是给出一份字段为空的对象（调用方会拿它去弹滑块，然后当场失败）
+        assert!(
+            parse_captcha_config(&json!({"data": {"configs": {"captcha": {
+                "enabled": true, "prefix": "no8xfe"
+            }}}}))
+            .is_none()
+        );
+        assert!(parse_captcha_config(&json!({"data": {"configs": {}} })).is_none());
+        assert!(parse_captcha_config(&json!({})).is_none());
+    }
 }

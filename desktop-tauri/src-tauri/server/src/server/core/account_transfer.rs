@@ -211,7 +211,11 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
         let mut errors = stats.failures.clone();
         errors.extend(stats.skipped_items.iter().cloned());
         errors.extend(definition_warnings.iter().cloned());
-        crate::server::logging::log(
+        // 级别按**结果**给，不靠文案推断：`失败 {failed} 条` 是无条件拼接的，
+        // 于是「失败 0 条」这种完全成功的导入也含「失败」二字，会被
+        // infer_level 判成 error —— 面板导航徽标只统计 error，等于每导入一次
+        // 就亮红标。（与 scheduled_tasks.rs 的凭证维护汇总同一处理。）
+        crate::server::logging::log_with_level(
             "[Accounts]",
             &format!(
                 "📥 账号导入完成: 共 {} 条，新增 {} 个，更新 {} 个，跳过 {} 条，失败 {failed} 条\
@@ -223,6 +227,7 @@ pub fn import_accounts(store: &AccountStore, payload: &Value) -> Result<Value, A
                 providers_added,
                 providers_updated,
             ),
+            if failed > 0 { "error" } else { "info" },
         );
         let result = json!({
             "total": items.len(),
@@ -392,7 +397,7 @@ fn import_one_item(
         }
         // 非 WorkBuddy 记录不该带腾讯端点字段：旧版导入曾把它们注入别家记录，
         // 这里在合并时清掉（其余各家的适配器都不读这些键，见各家凭证模块）
-        if provider != kind_id(ProviderKind::WorkBuddy) {
+        if !crate::server::core::providers::workbuddy::is_workbuddy_family(&provider) {
             for key in ["edition", "prefixPath", "endpoint", "platform"] {
                 state.accounts[index].remove(key);
             }

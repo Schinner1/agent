@@ -11,9 +11,14 @@
 //! }
 //! ```
 //! - **禁用**：模型在管理页里仍可见（开关关着），但不出现在 `/v1/models`，
-//!   请求它返回 404 model_not_found，**且不再参与转发路由** ——
-//!   `providers::router::route_for_forward` 会把这一家从候选链里剔除，
-//!   请求点名它、或被某条映射指向它（按该条目的 target 判）时都不会落到这里；
+//!   请求它的**原始 id** 返回 404 model_not_found，这一家的**原生路由**也不再
+//!   进候选链（`catalog::builtin_target` 的第一个分支按 `default_enabled` 判定）。
+//!   **别名不受牵连**：映射条目只吃自己的 `enabled` 开关，目标模型被关不会挡住
+//!   别名 —— `manifest_for` 刻意保留被关掉的上游记录（理由见该函数的注释），
+//!   别名照旧解析得到它。所以「关掉主模型、用别名照样请求得到」是**预期行为**，
+//!   不是漏判；要让别名也失效，得关那条映射自己的开关（或删掉它）。
+//!   唯一例外是 `alias == target` 的自映射：它与模型的默认绑定共用一个开关
+//!   （`set_state` 同步两者），关模型即关它。
 //! - **映射**（照抄 OmniProxy 的模型映射语义）：把「上游模型（提供商 × 真名）」
 //!   以对外名 `alias` 暴露给下游。`alias` **自由命名**——允许与任何上游模型 id
 //!   同名（同名时该上游的原生路由仍在、且优先，映射是追加的兜底路，不存在遮蔽）；
@@ -68,10 +73,24 @@
 //! 因此「删除自定义模型」是从本数组里**移除**：用户要的是
 //! 「这个模型我登记错了，删掉」，语义上不存在「恢复」这一步。
 //!
-//! 这里刻意**不存** `maxOutputTokens` / `supportsImages` 之类的能力位：
-//! 用户无从知道这些值，而编一个默认值会让 `/v1/models` 对下游**撒谎**
-//! （例如声明支持图片实际不支持）。缺字段的后果只是 `list_item` 里少几个
-//! 元数据键（与图像模型同款行为），下游据此保守处理 —— 比给错值好。
+//! 登记条目**不编造能力位**：用户登记时并不知道真实值，给一个默认值等于让
+//! `/v1/models` 对下游**撒谎**（例如声明支持图片实际不支持）。缺字段的后果
+//! 只是 `list_item` 里少几个元数据键（与图像模型同款行为），下游据此保守
+//! 处理 —— 比给错值好。
+//!
+//! ── 能力位覆盖（`capabilities`）──────────────────────────────
+//! 但**上游给的值本身也可能是错的**：远程目录撒谎、静态表跟不上上游调整时，
+//! 下游拿到错的能力就会按错的形状构造请求（给不支持的模型发图片、按虚高的
+//! 窗口堆历史），而以前纠正它的唯一手段是改代码。`capabilities` 就是那层
+//! 纠正 —— 按 `(provider, id)` 存一组对下游出口的覆盖值，
+//! `providers::catalog::manifest_for` 在清单成型处统一应用，于是 `/v1/models`
+//! （含 Anthropic 列表视图）与管理页一次全通。键名与归一规则在
+//! `core::capability`：内置家的覆盖存本模块，自定义家存在提供商记录的
+//! `models[].capabilities` 里，**两份存储共用同一套判定**。
+//!
+//! 与其它列表的语义差别：`capabilities` 是**纯出口元数据**，网关内部不读这
+//! 几个键做任何决策（路由 / 启停 / 转发都与它无关），所以它不影响
+//! `disabled` / `mappings` / `custom` 的任何行为。
 //!
 //! 所有比对忽略大小写（与 `catalog::providers_for_model` 同口径）。
 //!
@@ -98,6 +117,19 @@ pub const KEY_MODEL_RULES: &str = "modelRules";
 mod cline;
 
 pub use cline::{migrate_cline_split, seed_cline_defaults};
+
+/// WorkBuddy 专用的规则件：默认启用白名单种子 + **拆家迁移**。
+///
+/// 与 `cline` 同一模式（那家是拆池、本家是拆地区，两次迁移的形态也接近）：
+/// 拆出去的理由见那个文件的模块头（拆家迁移与长期机制不该混在一起，
+/// 以及单文件体量约定）。`pub use` 让调用方仍写
+/// `model_rules::seed_workbuddy_defaults` / `model_rules::migrate_workbuddy_split`。
+mod workbuddy;
+
+pub use workbuddy::{
+    migrate_workbuddy_split, seed_workbuddy_defaults, SplitMigrationOutcome,
+    WORKBUDDY_DEFAULT_ENABLED,
+};
 
 /// 思考等级组件（候选表 + 归一规则 + 设计取舍说明）。
 ///
@@ -198,6 +230,42 @@ impl CustomModel {
     }
 }
 
+/// 一条能力位覆盖：`(provider, id)` 的模型对下游声明的能力位（见模块头的
+/// 「能力位覆盖」）。
+///
+/// `values` 是**稀疏表**：只存被覆盖的键（键名与归一规则在
+/// `core::capability`），没被覆盖的键沿用清单原值。空表不存在 —— 写侧
+/// （[`set_capabilities`]）会把清空的条目整条移除，读取侧也丢弃空条目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityOverride {
+    pub provider: String,
+    pub id: String,
+    pub values: Map<String, Value>,
+}
+
+impl CapabilityOverride {
+    /// 是否命中 `(provider, id)`（都忽略大小写，与 `CustomModel::matches` 同口径）。
+    ///
+    /// `pub`：管理视图（`catalog::manage_view`）要按同一口径在快照里查
+    /// 「这条模型被覆盖了哪几项」—— 在那里另写一遍比较，迟早会与这里分叉。
+    pub fn matches(&self, provider: &str, id: &str) -> bool {
+        self.provider.eq_ignore_ascii_case(provider) && self.id.eq_ignore_ascii_case(id)
+    }
+
+    /// 落盘的 JSON 形态：`{provider, id, …各能力键}` —— 能力值**平铺**在条目
+    /// 上（不再套一层 `values` 对象）：手改 config.json 时一眼能看出这条覆盖
+    /// 了哪几项，而多一层嵌套只会让排查多一次展开。
+    fn to_value(&self) -> Value {
+        let mut object = Map::new();
+        object.insert("provider".to_string(), Value::String(self.provider.clone()));
+        object.insert("id".to_string(), Value::String(self.id.clone()));
+        for (key, value) in &self.values {
+            object.insert(key.clone(), value.clone());
+        }
+        Value::Object(object)
+    }
+}
+
 impl Mapping {
     /// 落盘的 JSON 形态。
     ///
@@ -232,6 +300,8 @@ pub struct ModelRules {
     pub mappings: Vec<Mapping>,
     /// 用户手动登记的上游模型（清单的补充来源，见模块头）
     pub custom: Vec<CustomModel>,
+    /// 能力位覆盖（对下游出口的纠正，见模块头的「能力位覆盖」）
+    pub capabilities: Vec<CapabilityOverride>,
     pub seeded: Vec<String>,
 }
 
@@ -309,6 +379,44 @@ fn custom_from(value: Option<&Value>) -> Vec<CustomModel> {
         .unwrap_or_default()
 }
 
+/// 从 JSON 数组还原能力覆盖列表（值走 `core::capability` 的归一）。
+///
+/// 容错口径与 `custom_from` 同一条：`provider` / `id` 必填 —— 少了就不知道
+/// 该覆盖哪一家的哪条模型，等于一条永不生效的死数据。非法能力键 / 非法值
+/// 在归一里被丢弃；**归一后为空的条目也丢弃**（它等价于「没有覆盖」，留着
+/// 只会让管理页的「已改」标记与 `capOverrides` 多列几个并不生效的键）。
+fn capabilities_from(value: Option<&Value>) -> Vec<CapabilityOverride> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let object = item.as_object()?;
+                    let id = object.get("id").and_then(Value::as_str).map(str::trim).unwrap_or("");
+                    let provider = object
+                        .get("provider")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if id.is_empty() || provider.is_empty() {
+                        return None;
+                    }
+                    let values = crate::server::core::capability::normalize_object(Some(item));
+                    if values.is_empty() {
+                        return None;
+                    }
+                    Some(CapabilityOverride {
+                        provider: provider.to_string(),
+                        id: id.to_string(),
+                        values,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl ModelRules {
     pub fn from_raw(raw: &Map<String, Value>) -> Self {
         let Some(object) = raw.get(KEY_MODEL_RULES).and_then(Value::as_object) else {
@@ -363,6 +471,7 @@ impl ModelRules {
             // 落盘时整份替换会把它从 config.json 里自然抹掉。
             mappings,
             custom: custom_from(object.get("custom")),
+            capabilities: capabilities_from(object.get("capabilities")),
             seeded: object
                 .get("seeded")
                 .and_then(Value::as_array)
@@ -389,6 +498,9 @@ impl ModelRules {
             // `config::update_raw_field`），漏掉哪个键，任何一次写规则
             // （启停 / 加映射 / 删映射 / 四个种子）都会把那个键的数据整份抹掉。
             "custom": self.custom.iter().map(CustomModel::to_value).collect::<Vec<_>>(),
+            // 与 `custom` 同一条硬约束：本函数是整份替换，漏写出哪个键，
+            // 任何一次写规则都会把那个键的数据整份抹掉。
+            "capabilities": self.capabilities.iter().map(CapabilityOverride::to_value).collect::<Vec<_>>(),
             "seeded": self.seeded,
         })
     }
@@ -492,6 +604,14 @@ impl ModelRules {
     /// 升级前的 `seeded` 存的是纯 id（旧版种子是全局动作），读取时对这两家
     /// 保留「纯 id 也算已种」的兼容：重种一遍只是把同样的默认值再写一次，
     /// 没必要。
+    ///
+    /// ── WorkBuddy 国际版**不继承**国内版的种子标记（2026-10 拆家）────
+    /// `migrate_workbuddy_split` 会把 `workbuddy:<id>` 的标记**复制**一份给
+    /// 国际版（那条迁移在拆家那一刻跑一次）。但读取层**不能**在这里把
+    /// 「`workbuddy:<id>` 存在」当成「`workbuddy-intl:<id>` 已种」：
+    /// 拆家之后新出现在国际版清单里的模型必须按正常种子路径判一次
+    /// （不在白名单里就默认禁用），而继承国内版的标记会让它们直接跳过种子、
+    /// 默认全开。两件事各归各处：迁移负责存量，读取层不猜。
     ///
     /// 但这个兼容**不能给所有 provider 开**：Qoder 的目录里有 `Auto` /
     /// `GLM-5.3` / `DeepSeek-V4-Pro` 这类与 workbuddy / raccoon 清单**同名**的
@@ -751,9 +871,103 @@ pub fn remove_custom(provider: &str, id: &str) -> (ModelRules, bool) {
                     .as_deref()
                     .is_some_and(|owner| owner.eq_ignore_ascii_case(provider)))
         });
+        // 针对它的能力覆盖（provider 必填，matches 就是精确定位）
+        rules.capabilities.retain(|entry| !entry.matches(provider, id));
         save(&rules);
     }
     (rules, removed)
+}
+
+/// 把该家的能力覆盖写进整份清单（内置家清单出口的统一调用点，见
+/// `providers::catalog::manifest_for`）。
+///
+/// 收在「整份清单一次」而不是「一条条目一次」，是性能上的硬约束：
+/// `current()` 每次调用都要重新解析整份 modelRules，逐条调用会让一次
+/// `/v1/models` 把同一份配置解析几百遍。
+pub fn apply_capability_overrides(provider: &str, items: &mut [Value]) {
+    let rules = current();
+    if rules.capabilities.is_empty() {
+        return;
+    }
+    for item in items.iter_mut() {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or("");
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(entry) = rules
+            .capabilities
+            .iter()
+            .find(|entry| entry.matches(provider, id))
+        {
+            crate::server::core::capability::apply_overrides(item, &entry.values);
+            // 来源标记：被覆盖的键从此是**用户指定**的值，既不是上游给的也不是
+            // models.dev 补的（管理页要把这三档分开显示，见 `core::model_meta`
+            // 的模块头）。覆盖在 models.dev 补齐**之后**执行，所以这里改的是
+            // 已经标好的那几项。
+            crate::server::core::model_meta::mark_user(
+                item,
+                &crate::server::core::capability::overridden_keys(&entry.values),
+            );
+        }
+    }
+}
+
+/// 应用一次能力覆盖补丁：`(provider, id)` × `patch`（管理页「模型能力」弹窗的
+/// 保存入口）。
+///
+/// `patch` 的三态（与本模块其它写接口同一套协议）：
+///   · 键**缺失**   → 不改这一项；
+///   · 键给 `null`  → **清除**这一项的覆盖（回到清单原值）；
+///   · 键给合法值   → 覆盖这一项（合法值判定在 `core::capability`；非法值
+///                     在这里被丢弃 —— API 层已经拦过一遍，这层是防御）。
+///
+/// 清除到一项不剩的条目**整条移除**（与读取侧的「空条目丢弃」同一口径：
+/// 空覆盖等价于没有覆盖）。落盘失败返回 Err，调用方按整体失败处理。
+pub fn set_capabilities(
+    provider: &str,
+    id: &str,
+    patch: &Map<String, Value>,
+) -> Result<ModelRules, String> {
+    let mut rules = current();
+    let index = rules
+        .capabilities
+        .iter()
+        .position(|entry| entry.matches(provider, id));
+    let mut values = match index {
+        Some(index) => rules.capabilities[index].values.clone(),
+        None => Map::new(),
+    };
+    for (key, value) in patch {
+        if value.is_null() {
+            values.remove(key);
+        } else if let Some(normalized) =
+            crate::server::core::capability::normalize_value(key, value)
+        {
+            values.insert(key.clone(), normalized);
+        }
+    }
+    match index {
+        Some(index) if values.is_empty() => {
+            rules.capabilities.remove(index);
+        }
+        Some(index) => rules.capabilities[index].values = values,
+        // 新条目且归一后为空 = 这次补丁什么都没改（API 层已拦非法值，
+        // 走到这里只剩「全清一个本来不存在的覆盖」这类空操作）
+        None if values.is_empty() => return Ok(rules),
+        None => rules.capabilities.push(CapabilityOverride {
+            provider: provider.to_string(),
+            id: id.to_string(),
+            values,
+        }),
+    }
+    if !save(&rules) {
+        return Err("模型能力保存失败".to_string());
+    }
+    Ok(rules)
 }
 
 /// 该 `(provider, id)` 是否是用户手动登记的自定义模型。
@@ -1072,11 +1286,6 @@ pub fn seed_raccoon_defaults(ids: &[String]) -> Option<String> {
 
 // ─── 各清单的「默认启用白名单」种子 ────────────────────
 
-/// WorkBuddy 清单的**默认启用白名单**：模型首次出现在清单里时，只有这里的
-/// 模型保持默认启用，其余一律默认**禁用**（管理页可见、开关关着，用户可手动
-/// 启用 —— 与小浣熊种子同一哲学：「默认值」只决定初始状态，不决定 forever）。
-pub const WORKBUDDY_DEFAULT_ENABLED: &[&str] = &["hy3", "hy4-preview-f", "deepseek-v4.1-flash"];
-
 /// Qoder 清单的**默认启用白名单**：同 WorkBuddy 种子的语义，只是白名单里
 /// 只留一个模型。
 ///
@@ -1091,20 +1300,6 @@ pub const WORKBUDDY_DEFAULT_ENABLED: &[&str] = &["hy3", "hy4-preview-f", "deepse
 /// 「装上就能用」的预期。
 pub const QODER_DEFAULT_ENABLED: &[&str] = &["Qwen3.8-Flash"];
 
-/// WorkBuddy 清单的**默认规则种子**：对 `ids` 里每个还没种过的模型记入
-/// `seeded`，不在 [`WORKBUDDY_DEFAULT_ENABLED`] 里的同时默认禁用。
-///
-/// 调用点有两类：清单**首次落地**（`core::models` 的 `apply_remote`，覆盖
-/// /v3/config 与企业清单两条路径），以及编排入口对**当前缓存清单**的补种
-/// （见 `providers::adapter` 的 `seed_current_workbuddy_defaults` —— 覆盖启动时
-/// 只有内置清单、或刷新失败停留在旧清单的情形）。幂等：种过的 id 不再动，
-/// 用户事后在管理页的手动启用 / 禁用不会被清单刷新改回去。
-///
-/// 返回给日志的摘要；没有新种过的模型时返回 None（不落盘）。
-pub fn seed_workbuddy_defaults(ids: &[String]) -> Option<String> {
-    seed_default_enabled("workbuddy", "WorkBuddy", WORKBUDDY_DEFAULT_ENABLED, ids)
-}
-
 /// Qoder 清单的**默认规则种子**：语义与 [`seed_workbuddy_defaults`] 完全一致，
 /// 只是白名单是 [`QODER_DEFAULT_ENABLED`]。
 ///
@@ -1112,8 +1307,8 @@ pub fn seed_workbuddy_defaults(ids: &[String]) -> Option<String> {
 /// 目录从上游拉回来时），以及编排入口对**当前缓存清单**的补种（见
 /// `providers::adapter` 的 `seed_current_qoder_defaults` —— 覆盖「有账号但远程
 /// 刷新失败，手里只有静态兜底清单」与升级用户首次打开管理页的情形）。
-pub fn seed_qoder_defaults(ids: &[String]) -> Option<String> {
-    seed_default_enabled("qoder", "Qoder", QODER_DEFAULT_ENABLED, ids)
+pub fn seed_qoder_defaults(provider: &str, label: &str, ids: &[String]) -> Option<String> {
+    seed_default_enabled(provider, label, QODER_DEFAULT_ENABLED, ids)
 }
 
 /// 「默认启用白名单」种子的公共实现（WorkBuddy 与 Qoder 共用）。

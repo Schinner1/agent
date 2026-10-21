@@ -6,7 +6,8 @@
 //!
 //! 聚合规则逐条对照 Node：
 //!   - 按行切 `data:`，`[DONE]` 与空行跳过
-//!   - `delta.content` / `delta.reasoning_content` 字符串拼接
+//!   - `delta.content` / `delta.reasoning_content` / `delta.reasoning` 字符串拼接
+//!     （最后一种是 Cline 免费池的写法，见 `consume_line` 的说明）
 //!   - `delta.tool_calls` 按 `index` 合并（id/type 覆盖、function.name 与
 //!     function.arguments 追加）
 //!   - `usage` 取最后一次出现（上游在末尾 chunk 下发）
@@ -28,7 +29,7 @@ use serde_json::{json, Map, Value};
 use crate::server::errors::GatewayError;
 
 use super::cancellation;
-use super::sse::ModelRewrite;
+use super::sse::{is_newline_keepalive, FramePolicy, ModelRewrite};
 use super::usage::RequestTelemetry;
 
 /// 流式读取的上限保护：单条 SSE 行长度（解析失败的行会原样丢掉，
@@ -52,23 +53,31 @@ pub struct AggregatedCompletion {
 /// **不影响返回的 body**（usage 的透传口径由 aggregate 自己的
 /// `self.usage` 负责，与这里无关，两条路径互不干扰）。
 ///
-/// `model_rewrite` 与流式分支同源（适配器的 `sse_model_rewrite()`）：
-/// **非流式响应体里的 `model` 同样要回写**成客户端请求的名字 ——
-/// 客户端拿到的 model 名不该因为「要不要流式」而变样（源实现
-/// `forwardChatCompletions` 的非流式分支也是 `payload.model = requestedModel`）。
+/// `policy` 与流式分支同源（适配器的 `sse_model_rewrite()` 与
+/// `sse_strip_newline_chunks()`）：**非流式响应体里的 `model` 同样要回写**成
+/// 客户端请求的名字 —— 客户端拿到的 model 名不该因为「要不要流式」而变样
+/// （源实现 `forwardChatCompletions` 的非流式分支也是
+/// `payload.model = requestedModel`）。保活换行分片同理：上游插的那些
+/// 「整片只有换行」的分片在流式里会被丢掉，非流式若照抄就把同一个噪声以
+/// 词间换行的形式交给了客户端（见 `sse.rs` 模块头的实测）。
 pub async fn aggregate_sse_completion(
     response: reqwest::Response,
     telemetry: Arc<RequestTelemetry>,
-    model_rewrite: Option<ModelRewrite>,
+    policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 与 `ForwardStream::new` 同款：reqwest 错误在这里就地描述成文案折进
     // io::Error（`describe_error_detail` 只认 reqwest::Error）
-    let stream = response.bytes_stream().map(|item| {
-        item.map_err(|error| {
+    let capture = telemetry.capture();
+    let stream = response.bytes_stream().map(move |item| {
+        let item = item.map_err(|error| {
             std::io::Error::other(crate::server::core::egress::describe_error_detail(&error))
-        })
+        });
+        if let (Ok(bytes), Some(capture)) = (&item, &capture) {
+            capture.push(bytes);
+        }
+        item
     });
-    aggregate_frame_stream(Box::pin(stream), telemetry, model_rewrite).await
+    aggregate_frame_stream(Box::pin(stream), telemetry, policy).await
 }
 
 /// 聚合一条**标准 chat SSE** 字节流（不限定来源）。
@@ -76,12 +85,13 @@ pub async fn aggregate_sse_completion(
 /// 自定义家的翻译协议（responses / anthropic 上游）在进入本函数前先过
 /// `providers::custom` 的 `ProtocolTranslateStream` —— 本函数与
 /// [`aggregate_sse_completion`] 共用同一套聚合规则，只是输入从
-/// reqwest::Response 换成已翻译的帧流。telemetry / model_rewrite 的语义
+/// reqwest::Response 换成已翻译的帧流。telemetry / policy 的语义
 /// 与那个函数完全一致（见它的说明）。
+/// 原始报文由输入流在翻译前采集，本函数不重复采集内部 chat 帧。
 pub async fn aggregate_frame_stream(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
-    model_rewrite: Option<ModelRewrite>,
+    policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // 非流式响应总超时（设置页「请求超时」第四项）：**一次性计时、不重置**
     // —— 与流式的空闲超时是两种语义（那是「两次数据之间」，这里读完整份
@@ -91,7 +101,7 @@ pub async fn aggregate_frame_stream(
     let budget = std::time::Duration::from_millis(
         crate::server::config::timeout_settings().body_ms(),
     );
-    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, model_rewrite))
+    match tokio::time::timeout(budget, aggregate_frame_stream_inner(stream, telemetry, policy))
         .await
     {
         Ok(result) => result,
@@ -106,7 +116,7 @@ pub async fn aggregate_frame_stream(
 async fn aggregate_frame_stream_inner(
     stream: futures::stream::BoxStream<'static, Result<bytes::Bytes, std::io::Error>>,
     telemetry: Arc<RequestTelemetry>,
-    model_rewrite: Option<ModelRewrite>,
+    policy: FramePolicy,
 ) -> Result<AggregatedCompletion, GatewayError> {
     // ── 手动终止的旁路流（与 `ForwardStream::from_translated` 同一手法）──
     // 聚合是 `while let Some(item) = stream.next().await` 的拉取循环：没有
@@ -122,7 +132,11 @@ async fn aggregate_frame_stream_inner(
     // 非流式总超时（默认 300 秒）才报 502（详见 `cancellable` 的说明）。
     let mut stream = cancellation::cancellable(stream, telemetry.cancel_token());
     let mut buffer = String::new();
-    let mut acc = CompletionAccumulator { rewrite: model_rewrite, ..Default::default() };
+    let mut acc = CompletionAccumulator {
+        rewrite: policy.rewrite,
+        strip_newline_chunks: policy.strip_newline_chunks,
+        ..Default::default()
+    };
     // 首响采集：聚合路径不走 RecordingStream（客户端要的是完整 JSON，
     // 没有下发流可言），所以第一个**上游** chunk 在这里记 —— 它就是
     // 「上游开始吐内容」的时刻。非流式请求的用时要等聚合完才有意义，
@@ -149,11 +163,7 @@ async fn aggregate_frame_stream_inner(
             first_chunk_seen = true;
             telemetry.note_first_frame();
         }
-        // 调试模式：上游原始字节旁路给采集器（在解析之前 —— 采的是上游原样
-        // 吐出的 SSE 文本，不是我们解析 / 改写后的结果）
-        if let Some(capture) = telemetry.capture() {
-            capture.push(&chunk);
-        }
+        // 原始字节由输入侧（HTTP 字节流或协议翻译流）采集，聚合器只消费 chat 帧。
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         // 逐行消费（只处理到最后一个 '\n' 之前的内容）
         while let Some(index) = buffer.find('\n') {
@@ -192,6 +202,9 @@ struct CompletionAccumulator {
     tool_calls: BTreeMap<i64, Value>,
     /// model 名回写参数（None = 不改写，沿用上游给的 model）
     rewrite: Option<ModelRewrite>,
+    /// 丢弃「整片只有换行」的 content 分片（WorkBuddy / AutoClaw 的保活节拍，
+    /// 判据与理由见 `sse::is_newline_keepalive`）。false = 与接入前逐字一致。
+    strip_newline_chunks: bool,
 }
 
 impl CompletionAccumulator {
@@ -268,10 +281,26 @@ impl CompletionAccumulator {
             }
         }
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
-            self.content.push_str(content);
+            // 保活换行分片：只跳过**正文拼接**，不提前 return —— 同一帧的
+            // id / model / created / role / usage 照常记账（流式分支也是这个
+            // 次序：先旁路提取与记元数据，再决定丢这一帧）。两条路径口径一致，
+            // 「同一个请求要不要流式」才不会出现两种正文。
+            let keepalive = self.strip_newline_chunks && is_newline_keepalive(chunk);
+            if !keepalive {
+                self.content.push_str(content);
+            }
         }
-        if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
-            self.reasoning.push_str(reasoning);
+        // 思考增量挂在哪个字段上，上游并不统一：`reasoning_content`（多数
+        // OpenAI 兼容网关）与 `reasoning`（Cline 免费池实测，配 `reasoning_details`）
+        // 两种都见过。只认前者会把「整段输出都是思考」的响应聚合成一条
+        // content 空、reasoning 也空的消息 —— 下游的空回检测据此报
+        // 「empty response detected」。参考实现 cline-proxy 的 `sawContent`
+        // 同样把 `reasoning` 算作内容，理由与这里一样（见其 proxy.go 的注释）。
+        // 两个字段都累加、不互斥：与 cline-proxy 逐字同口径。
+        for key in ["reasoning_content", "reasoning"] {
+            if let Some(reasoning) = delta.get(key).and_then(Value::as_str) {
+                self.reasoning.push_str(reasoning);
+            }
         }
         if let Some(finish) = choice.get("finish_reason").and_then(Value::as_str) {
             if !finish.is_empty() {
@@ -303,6 +332,24 @@ impl CompletionAccumulator {
 
     /// 组装最终 body（对应 Node 的 handleChunk 结束后的返回对象）
     fn into_completion(self) -> AggregatedCompletion {
+        // ── 诊断：上游只回了思考、正文为空 ──────────────────────────
+        // 这是**允许发生**的一种结局（始终思考的模型在小输出额度下会把额度
+        // 全花在思考上，上游仍回 200，见 `providers::zcode::reasoning` 的模块头）。
+        // 网关不在这里改协议 —— 伪造一个错误帧会让「上游到底说了什么」失去
+        // 可信度；这里只把事实写进日志：排查这类问题时最缺的正是
+        // 「上游其实只回了思考」这一条。
+        if self.content.trim().is_empty() && !self.reasoning.trim().is_empty() {
+            crate::server::logging::verbose(
+                "[Model]",
+                &format!(
+                    "⚠️ 上游只回了思考、正文为空（model={} finish={} 思考 {} 字）：\
+                     多为输出额度被思考吃光，可调高 max_tokens 或降低思考档位",
+                    self.model,
+                    if self.finish.is_empty() { "-" } else { &self.finish },
+                    self.reasoning.chars().count(),
+                ),
+            );
+        }
         let mut message = Map::new();
         message.insert(
             "role".to_string(),
@@ -362,7 +409,14 @@ impl CompletionAccumulator {
     }
 }
 
-/// 合并一个 tool_call 增量到已累积的条目上（id/type 覆盖、name/arguments 追加）
+/// 合并一个 tool_call 增量到已累积的条目上（id/type 覆盖、name/arguments 追加）。
+///
+/// `extra_content` 也要保留：antigravity 把 Gemini 的思考签名挂在
+/// `extra_content.google.thought_signature`（见 `antigravity_stream.rs` 的
+/// tool_call_frames），客户端下一轮原样回传、出站侧 `call_signature` 靠它回填
+/// `functionCall.thoughtSignature` —— 丢掉它，非流式（聚合器）路径的下一轮
+/// 工具续接就会被上游 400「Function call is missing a thought_signature」
+/// （issue #237）。签名只在流式增量里出现一次，直接覆盖不拼接。
 fn merge_tool_call(entry: &mut Value, incoming: &Value) {
     let Some(target) = entry.as_object_mut() else {
         return;
@@ -375,6 +429,11 @@ fn merge_tool_call(entry: &mut Value, incoming: &Value) {
     if let Some(kind) = incoming.get("type").and_then(Value::as_str) {
         if !kind.is_empty() {
             target.insert("type".to_string(), Value::String(kind.to_string()));
+        }
+    }
+    if let Some(extra) = incoming.get("extra_content") {
+        if !extra.is_null() {
+            target.insert("extra_content".to_string(), extra.clone());
         }
     }
     let Some(function) = incoming.get("function") else {
@@ -415,5 +474,138 @@ fn js_number_truthy(value: &Value) -> bool {
         Value::Number(number) => number.as_f64().map(|item| item != 0.0).unwrap_or(false),
         Value::String(text) => !text.is_empty(),
         Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 喂一行 SSE（非 JSON / 非 data: 行静默忽略，与生产路径一致）
+    fn feed(acc: &mut CompletionAccumulator, line: &str) {
+        let telemetry = RequestTelemetry::new();
+        acc.consume_line(line, &telemetry)
+            .unwrap_or_else(|error| panic!("consume_line 失败：{error}"));
+    }
+
+    /// 上游把思考放在 `delta.reasoning`（Cline 免费池实测的写法，配
+    /// `reasoning_details`）时，非流式聚合必须把它留下：只认 `reasoning_content`
+    /// 会让「整段输出都是思考」的响应聚合成 content 空、reasoning 也空的消息，
+    /// 下游的空回检测（如 AxonHub）据此报「empty response detected」。
+    /// 参考实现 cline-proxy 的 `sawContent` 同样把 `reasoning` 算作内容。
+    #[test]
+    fn reasoning_delta_is_kept() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning":"我们先分析"},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning":"题目。"},"finish_reason":"length"}]}"#,
+        );
+        feed(&mut acc, "data: [DONE]");
+
+        let body = acc.into_completion().body;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["reasoning_content"], "我们先分析题目。");
+        // content 本来就空 —— 聚合结果里必须仍有一条非空的可读字段，
+        // 这正是「有没有内容」的判据
+        assert_eq!(message["content"], "");
+    }
+
+    /// `reasoning_content` 与 `reasoning` 都累加、互不排斥（与 cline-proxy
+    /// 逐字同口径）：上游在不同分片里换字段时不会丢内容。
+    #[test]
+    fn both_reasoning_fields_accumulate() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"甲"},"finish_reason":null}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"reasoning":"乙"},"finish_reason":null}]}"#,
+        );
+        let body = acc.into_completion().body;
+        assert_eq!(body["choices"][0]["message"]["reasoning_content"], "甲乙");
+    }
+
+    /// 纯正文分片不受影响（reasoning 字段为空时不写回该键）
+    #[test]
+    fn content_only_stays_as_before() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"content":"你好"},"finish_reason":"stop"}]}"#,
+        );
+        let body = acc.into_completion().body;
+        let message = &body["choices"][0]["message"];
+        assert_eq!(message["content"], "你好");
+        assert!(message.get("reasoning_content").is_none());
+    }
+
+    /// `extra_content` 必须随 tool_call 保留（issue #237）：antigravity 的思考
+    /// 签名挂在 `extra_content.google.thought_signature`，客户端下一轮原样回传、
+    /// 出站侧靠它回填 `functionCall.thoughtSignature` —— 聚合形态丢掉它，
+    /// 非流式客户端的下一轮工具续接会被上游 400「missing a thought_signature」。
+    #[test]
+    fn tool_call_extra_content_survives_aggregation() {
+        let mut acc = CompletionAccumulator::default();
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"pwsh","arguments":""},"extra_content":{"google":{"thought_signature":"sig_abc"}}}]}}]}"#,
+        );
+        feed(
+            &mut acc,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
+        feed(&mut acc, "data: [DONE]");
+
+        let body = acc.into_completion().body;
+        let call = &body["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "pwsh");
+        assert_eq!(call["function"]["arguments"], r#"{"command":"ls"}"#);
+        assert_eq!(
+            call["extra_content"]["google"]["thought_signature"], "sig_abc",
+            "签名丢了，下一轮 functionCall 就缺 thoughtSignature"
+        );
+    }
+
+    /// 把「A / \n / ' B'」三帧折成一份非流式正文（`strip` = 丢不丢保活换行）
+    fn fold(strip: bool) -> String {
+        let mut acc = CompletionAccumulator {
+            strip_newline_chunks: strip,
+            ..Default::default()
+        };
+        let telemetry = RequestTelemetry::new();
+        for delta in [json!({"content": "A"}), json!({"content": "\n"}), json!({"content": " B"})] {
+            let chunk = json!({
+                "id": "c1",
+                "model": "m",
+                "created": 1,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": null}],
+                "usage": Value::Null,
+            });
+            acc.consume_chunk(&chunk, &telemetry)
+                .expect("测试里的帧不该被判成上游错误");
+        }
+        let body = acc.into_completion().body;
+        body.pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn non_stream_folding_drops_the_keepalive_newlines_too() {
+        // 两条路径口径必须一致：同一个请求要不要流式，正文不该长得不一样
+        assert_eq!(fold(false), "A\n B", "关掉时照旧逐字拼接");
+        assert_eq!(fold(true), "A B", "开启时非流式客户端也拿不到那一记换行");
     }
 }

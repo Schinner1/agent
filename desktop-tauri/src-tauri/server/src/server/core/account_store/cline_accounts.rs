@@ -48,9 +48,9 @@ use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
-use crate::server::core::account_store::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
+use crate::server::core::account_store::store_util::{token_tail_of, truncate_chars};
 use crate::server::core::account_store::{
     is_cline_family, CredentialWrite, CLINE_FREE_PROVIDER_ID, CLINE_PASS_PROVIDER_ID,
     MAX_TOKEN_LENGTH,
@@ -70,6 +70,53 @@ const MAX_IDENTITY_LENGTH: usize = 256;
 /// 而标识为空时由调用方给出 token 指纹兜底。
 fn record_id(provider: &str, key: &str) -> String {
     format!("{provider}-{}", truncate_chars(key, MAX_IDENTITY_LENGTH))
+}
+
+/// `providers.json` 的**文本内容** → 一份 Cline 凭证（提取口径的唯一一份）。
+///
+/// ── 桌面导入与文件导入共用（别在调用方另写键名候选）──────────
+/// 两条链拿到的都是同一份文件的文本：
+///   - 桌面导入（`import_cline_desktop_account`）读**本机固定路径**
+///     `~/.cline/data/settings/providers.json`；
+///   - 文件导入（`add_cline_account_from_file`，`POST /api/accounts` 的
+///     `authFileContent`）读**用户手选内容**（可能来自另一台机器或备份）。
+/// 形状解析（`providers.cline.settings.auth` / `workos:` 前缀 / 毫秒
+/// `expiresAt` / `metadata.userInfo` 的展示名）全部委托给
+/// `credentials::credentials_from_desktop_settings`；本函数只做「文本 → Value」
+/// 与错误口径转换。口径分叉的症状会很难排查：「同一个文件，手选能导入、
+/// 本机路径却报格式不对」。
+///
+/// `invalid_json_message` 由调用方给：两条路对「文件不是 JSON」要说不同的指引
+/// （桌面导入指向本机客户端文件，文件导入指向用户刚选的那份），除此之外一字不差。
+fn cline_credentials_from_settings_text(
+    text: &str,
+    invalid_json_message: &str,
+) -> Result<credentials::ClineCredentials, AccountStoreError> {
+    let root: Value = serde_json::from_str(text)
+        .map_err(|_| AccountStoreError::new(invalid_json_message, 400))?;
+    credentials::credentials_from_desktop_settings(&root)
+        .map_err(|error| AccountStoreError::new(error.message, error.status_code))
+}
+
+/// 读本机固定路径的 Cline 登录态**文本**（桌面导入用）。
+///
+/// 文案与 `credentials::read_desktop_credentials` 对齐（文件不存在 → 提示先在
+/// 客户端登录；读不出来 → 500），让「点导入」与「转发时读文件」对同一个问题
+/// 说一样的话。这里直接读文本而不再经 `read_desktop_credentials`，是为了与
+/// 文件导入走同一个提取函数（见上）；那条函数的进程缓存（网关内存里的刷新
+/// 轮换结果）仍然只服务转发链路，不受本路径影响。
+fn read_desktop_settings_text() -> Result<String, AccountStoreError> {
+    let path = credentials::desktop_settings_path()
+        .map_err(|error| AccountStoreError::new(error.message, error.status_code))?;
+    if !path.exists() {
+        return Err(AccountStoreError::new(
+            "本机没有找到 Cline 登录态（请先在 Cline 客户端登录）",
+            400,
+        ));
+    }
+    std::fs::read_to_string(&path).map_err(|error| {
+        AccountStoreError::new(format!("读取本机 Cline 登录态失败: {error}"), 500)
+    })
 }
 
 impl AccountStore {
@@ -307,6 +354,7 @@ impl AccountStore {
             "name".to_string(),
             Value::String(truncate_chars(&record_name, MAX_NAME_LENGTH)),
         );
+        mark_name_custom(&mut fields, name.is_some_and(|value| !value.trim().is_empty()), existing.as_ref());
         if !account.is_empty() {
             fields.insert(
                 "account".to_string(),
@@ -384,7 +432,63 @@ impl AccountStore {
                 crate::server::core::providers::label_of(provider),
             ),
         );
-        Ok(self.to_cline_public_account(&saved))
+        Ok(self.public_account(&saved))
+    }
+
+    /// 文件导入：把用户**手选**的 `providers.json` 内容解析成凭证后落账号
+    /// （`POST /api/accounts` 的 `authFileContent` 分支，见 `api::accounts::add_account`）。
+    ///
+    /// ── 与 `import_cline_desktop_account` 是两条语义不同的路（别混用）──
+    ///   - 本函数（文件导入）＝把文件里的凭证**解析后落库**（token 落到实处），
+    ///     得到一个**可独立转发**的账号 —— 与「手动粘贴」同一语义，文件可来自
+    ///     任意机器或备份；
+    ///   - `import_cline_desktop_account`（`importDesktop: true`）＝只建一条
+    ///     `desktop: true` 的记录，**不落 token**，转发时实时读本机固定路径。
+    /// 两者同时给时以文件为准（用户的显式文件更强），顺序由
+    /// `api::accounts::add_account` 的分支保证。
+    ///
+    /// 提取口径与桌面导入共用（`cline_credentials_from_settings_text`），落账号
+    /// 复用 `add_cline_account`（校验 / `workos:` 前缀 / 撞 id 保护 / 备注名
+    /// 保留全在一处），因此这里只做「凭证 → 入参 payload」的搬运。
+    pub fn add_cline_account_from_file(
+        &self,
+        provider: &str,
+        content: &str,
+        name: Option<&str>,
+    ) -> Result<Value, AccountStoreError> {
+        let credentials = cline_credentials_from_settings_text(
+            content,
+            "不是合法 JSON（请选择 Cline 客户端登录后生成的 providers.json）",
+        )?;
+        // 键名取 `add_cline_account` 的入参口径（与手动粘贴 / 设备授权登录
+        // 落账号那条链一致）：`accessToken` 已带 `workos:` 前缀（helper 经凭证层
+        // 的 `ensure_token_prefix`），`expiresAt` 是**毫秒**时间戳（providers.json
+        // 的原单位，落盘口径与另外几家一致）。空值不入 payload —— 让
+        // `add_cline_account` 走它自己的兜底链（从 JWT 推过期时间 / 账号标识）。
+        let mut payload = Map::new();
+        payload.insert(
+            "accessToken".to_string(),
+            Value::String(credentials.access_token),
+        );
+        if !credentials.refresh_token.is_empty() {
+            payload.insert(
+                "refreshToken".to_string(),
+                Value::String(credentials.refresh_token),
+            );
+        }
+        if let Some(expires_at) = credentials.expires_at.filter(|value| *value > 0.0) {
+            payload.insert(
+                "expiresAt".to_string(),
+                crate::server::core::account_store::state::json_number(expires_at),
+            );
+        }
+        if !credentials.account.is_empty() {
+            payload.insert(
+                "account".to_string(),
+                Value::String(credentials.account),
+            );
+        }
+        self.add_cline_account(provider, &Value::Object(payload), name)
     }
 
     /// 导入桌面端实时登录态（建一条 `desktop: true` 的账号记录，凭证不落盘）。
@@ -403,14 +507,14 @@ impl AccountStore {
                 400,
             ));
         }
-        let credentials = credentials::read_desktop_credentials()
-            .map_err(|error| AccountStoreError::new(error.message, error.status_code))?
-            .ok_or_else(|| {
-                AccountStoreError::new(
-                    "本机没有找到 Cline 登录态（请先在 Cline 客户端登录）",
-                    400,
-                )
-            })?;
+        // 读本机固定路径的文本 → 走与文件导入共用的提取口径（见
+        // `cline_credentials_from_settings_text`）。注意「提取口径共用」不等于
+        // 「落账号函数共用」：桌面导入建的是 `desktop: true`、**不落 token** 的
+        // 记录（字段在下面自己组装），与文件导入落 token 是两条刻意的不同语义。
+        let credentials = cline_credentials_from_settings_text(
+            &read_desktop_settings_text()?,
+            "本机 Cline 登录态文件格式无效（应为 Cline 客户端登录后生成的 providers.json）",
+        )?;
         let id = credentials::desktop_account_id(provider);
         let _guard = self.guard();
         let existing = self.record_by_id(&_guard, &id);
@@ -469,6 +573,7 @@ impl AccountStore {
             "name".to_string(),
             Value::String(truncate_chars(&record_name, MAX_NAME_LENGTH)),
         );
+        mark_name_custom(&mut fields, name.is_some_and(|value| !value.trim().is_empty()), existing.as_ref());
         if !credentials.account.is_empty() {
             fields.insert(
                 "account".to_string(),
@@ -533,7 +638,7 @@ impl AccountStore {
                 if is_new { "已导入" } else { "已刷新" },
             ),
         );
-        Ok(self.to_cline_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// Cline 账号续期成功后回写新 token（适配器的 `persist_refresh` 调用）。
@@ -694,6 +799,23 @@ impl AccountStore {
         out.insert("source".to_string(), Value::String(record.source()));
         out.insert("addedAt".to_string(), Value::from(record.added_at()));
         out.insert("updatedAt".to_string(), Value::from(record.updated_at()));
+        // ── `rateLimits`：限额冷却标记，**漏不得**（曾经的漏洞）──────────
+        // 它不是「给界面看的附加字段」，而是**选路的输入**：上游 429 之后
+        // 转发层把冷却写在记录里（`store_admin::mark_rate_limited`），选路侧
+        // 只在**公开形态**上读 `rateLimits[<上游真名>].resetAt` 判「这个账号
+        // 对这个模型还能不能用」（见 `routing::rate_limit_reset_at` /
+        // `is_rate_limited`）。这份手写的组装漏掉它 = 冷却写了也没人看得见：
+        // 已限额的账号每次都被优先选中、白撞一次 429 再降级 —— 2026-10-03 在
+        // 线上实测到的正是这个形态（13:47:55 记限额，13:48:04 又选了同一条）。
+        // 另外八家（raccoon / catpaw / accio / qoder / codearts / autoclaw /
+        // trae / zcode）的公开形态都带这个键，模块头的字段清单也一直写着它。
+        out.insert(
+            "rateLimits".to_string(),
+            value
+                .get("rateLimits")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(Map::new())),
+        );
         out.insert(
             "available".to_string(),
             // 用 `has_credentials()` 而不是 `has_token()`：桌面端账号按设计不落
@@ -723,11 +845,13 @@ impl AccountStore {
         if let Some(expires) = expires {
             out.insert("expiresAt".to_string(), expires);
         }
-        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
-        // 0 = 不限，缺键同样输出 0
+        // 出网代理（账号级配置）：与其余八家的公开形态同形，前端代理列据此
+        // 回显「直连 / 代理池某条」。漏了它，即使记录里配了代理，界面也一律
+        // 显示「直连」——而转发其实照走代理（`session_from_record` 是全家
+        // 通用的，见 core::proxies 的模块头）。
         out.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(value.get("maxConcurrent"))),
+            "proxy".to_string(),
+            crate::server::core::proxies::describe_account_proxy(Some(&record.proxy())),
         );
         Value::Object(out)
     }
@@ -777,4 +901,141 @@ fn fingerprint(token: &str) -> String {
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 每条用例一个独立临时库（账号层测试碰的是真 SQLite）。
+    /// 守卫必须持有到用例结束，写法 `let (store, _db) = store("x");`。
+    fn store(label: &str) -> (AccountStore, crate::server::db::test_temp::TempDb) {
+        let (db, guard) =
+            crate::server::db::test_temp::TempDb::open(&format!("cline-accounts-{label}"));
+        (AccountStore::with_db(Some(db)), guard)
+    }
+
+    fn record(proxy: Value) -> StoredAccount {
+        StoredAccount::from_map(
+            json!({
+                "id": "cline-free-usr-01TEST",
+                "provider": "cline-free",
+                "account": "usr-01TEST",
+                "priority": 101,
+                "proxy": proxy,
+            })
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        )
+    }
+
+    /// 公开形态必须带上账号级代理配置 —— 前端代理列据此回显「直连 / 代理池某条」。
+    /// 漏了它，即使记录里配了代理，界面也一律显示「直连」（转发其实照走代理）。
+    #[test]
+    fn public_shape_carries_account_proxy() {
+        let (store, _db) = store("proxy-set");
+        let public = store.to_cline_public_account(&record(
+            json!({"source": "pool", "proxyId": "px_test_1"}),
+        ));
+        // 池条目在本测试的配置里不存在 → 解析失败是预期的，但 `config`
+        // 里必须原样带着 proxyId（前端靠它匹配下拉选项）
+        assert_eq!(public["proxy"]["source"], "pool");
+        assert_eq!(public["proxy"]["config"]["proxyId"], "px_test_1");
+    }
+
+    /// 未配代理时输出 null（与其余八家的公开形态同形），而不是缺键
+    #[test]
+    fn public_shape_has_null_proxy_when_unset() {
+        let (store, _db) = store("proxy-null");
+        let public = store.to_cline_public_account(&record(Value::Null));
+        assert!(public["proxy"].is_null());
+    }
+
+    /// 加一条 Cline 账号，返回它的 id（顺带证明公开形态带 id）。
+    fn add(store: &AccountStore, account: &str) -> String {
+        let payload = serde_json::json!({
+            "accessToken": "workos:token-for-tests-only",
+            "account": account,
+        });
+        let saved = store
+            .add_cline_account("cline-free", &payload, None)
+            .expect("账号应当能加进来");
+        saved
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("公开形态应当带 id")
+            .to_string()
+    }
+
+    /// 公开形态里的某条账号（按 id 找）。
+    fn public_account(store: &AccountStore, id: &str) -> Value {
+        store
+            .list_accounts()
+            .get("accounts")
+            .and_then(Value::as_array)
+            .and_then(|accounts| {
+                accounts
+                    .iter()
+                    .find(|item| item.get("id").and_then(Value::as_str) == Some(id))
+                    .cloned()
+            })
+            .expect("账号应当在列表里")
+    }
+
+    /// 429 冷却写进记录后，公开形态必须把它带出去 —— 漏了它就是「限额不生效」。
+    ///
+    /// 选路（`routing::is_rate_limited`）只在**公开形态**上查
+    /// `rateLimits[<上游真名>].resetAt`，而这份公开形态是手写组装的：漏掉这个键
+    /// 时冷却是「写进去了但没人看得见」—— 已限额的账号仍会被优先选中、白撞一次
+    /// 429 再降级。2026-10-03 线上实测到的正是这个形态：13:47:55 记下限额，
+    /// 13:48:04 的下一个请求又选了同一条账号，日志里「已限额…按优先级降级」
+    /// 连着出现两次。
+    ///
+    /// 冷却键取 `CooldownKeys`（与写入侧、判定侧同源）而不是写死字面量：将来
+    /// 真名解析若变（映射、别名），这条用例仍钉在「写进去的就能读出来」上。
+    #[test]
+    fn public_shape_carries_rate_limits() {
+        let (store, _db) = store("rate-limits");
+        let id = add(&store, "usr-rate-limit");
+
+        // 未限额时也要有键（空对象）：与别家的形状一致，界面与选路都不必再判
+        // 「键在不在」。这条同时把「漏键」钉死 —— 空对象和缺键在 JSON 里是两回事。
+        let fresh = public_account(&store, &id);
+        assert_eq!(
+            fresh
+                .get("rateLimits")
+                .and_then(Value::as_object)
+                .map(Map::len),
+            Some(0),
+            "未限额时应当是空对象（不是缺键）: {fresh}"
+        );
+
+        let keys = crate::server::core::routing::CooldownKeys::new("deepseek-v4.1-flash");
+        let wire = keys.for_account(&fresh);
+        store
+            .mark_rate_limited(
+                &id,
+                &wire,
+                429,
+                None,
+                None,
+                "上游返回 429: Daily free limit reached",
+            )
+            .expect("限额应当写进记录");
+
+        let account = public_account(&store, &id);
+        let entry = account
+            .get("rateLimits")
+            .and_then(|limits| limits.get(&wire))
+            .unwrap_or_else(|| panic!("公开形态必须带 rateLimits[{wire}]：{account}"));
+        assert_eq!(entry.get("status").and_then(Value::as_i64), Some(429));
+
+        // 最终判据：选路看到的就是「不可用（rate-limited）」
+        let now = crate::server::logging::now_ms();
+        let usability = crate::server::core::routing::account_usability(&account, &keys, now);
+        assert!(!usability.usable, "限额账号在选路里必须不可用: {account}");
+        assert_eq!(usability.reason, Some("rate-limited"));
+    }
 }

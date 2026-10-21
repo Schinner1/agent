@@ -20,9 +20,9 @@ use crate::server::logging;
 
 use super::priority::next_free_priority;
 use super::sql;
-use super::state::StoredAccount;
+use super::state::{mark_name_custom, StoredAccount};
 use super::store::{AccountStore, AccountStoreError};
-use super::store_util::{max_concurrent_public, token_tail_of, truncate_chars};
+use super::store_util::{token_tail_of, truncate_chars};
 use super::CredentialWrite;
 
 impl AccountStore {
@@ -141,6 +141,7 @@ impl AccountStore {
         fields.insert("id".to_string(), Value::String(id.clone()));
         fields.insert("provider".to_string(), Value::String(provider.to_string()));
         fields.insert("name".to_string(), Value::String(truncate_chars(&record_name, 100)));
+        mark_name_custom(&mut fields, name.is_some_and(|value| !value.trim().is_empty()), existing.as_ref());
         fields.insert(
             "tokenTail".to_string(),
             Value::String(token_tail_of(&credentials.access_token)),
@@ -247,10 +248,6 @@ impl AccountStore {
         );
         public.insert("desktop".to_string(), Value::Bool(false));
         public.insert("available".to_string(), Value::Bool(available));
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
-        );
         Value::Object(public)
     }
 }

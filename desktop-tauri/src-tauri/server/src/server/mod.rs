@@ -183,9 +183,18 @@ pub struct ServerState {
     /// `/v1/*` 网关，静态界面与 `/api/*` 挂到 `p` —— 面板端口可以不暴露公网，
     /// 管理面整体留在内网。桌面壳不设置它。
     pub panel_port: Option<u16>,
-    /// 监听地址。桌面壳固定 127.0.0.1（单机安全边界）；headless 二进制按
-    /// `AGENT2API_HOST` 解析（默认 0.0.0.0，供容器端口映射）。
+    /// 监听地址。桌面壳默认 127.0.0.1（单机安全边界；用户开启局域网访问后为
+    /// 0.0.0.0）；headless 二进制按 `AGENT2API_HOST` 解析（默认 0.0.0.0，供容器
+    /// 端口映射）。
     pub host: IpAddr,
+    /// 管理界面跑在本机（桌面壳的 Tauri 窗口）。
+    ///
+    /// 桌面壳固定 true；headless 恒 false。它与 `host.is_loopback()` 是两个维度：
+    /// 桌面壳开了局域网访问后 host 是 0.0.0.0，但发起管理操作的浏览器（Tauri
+    /// 窗口）仍在本机 —— OAuth 回调该占本机登记端口（见
+    /// `api::session::login_oauth_start` 的 `local_browser`）。headless 不设它，
+    /// 回退按 `host.is_loopback()` 判（容器绑回环没有意义，判 false 是对的）。
+    pub local_panel: bool,
     /// 配置目录（`~/.agent2api`），与壳侧 gateway::config_dir() 同源
     pub config_dir: PathBuf,
     /// headless 下托管管理界面（`ui/` 静态目录）的根；`None` = 不托管
@@ -288,6 +297,13 @@ impl ServerState {
         // 端口在进程生命周期内不变，这里写一次、之后只读 —— 与各家 models 的
         // 进程级缓存同一手法（见 `providers::accio::oauth::set_loopback_port`）。
         crate::server::core::providers::accio::oauth::set_loopback_port(port);
+        // CodeArts 同理：授权地址由适配器拼（同步无参），而 portal 只认 `port`，
+        // 所以端口要在发起登录之前就写在进程级常量里（见该模块 `set_loopback_port`）。
+        crate::server::core::providers::codearts::oauth::set_loopback_port(port);
+        // Antigravity 的网页登录同理：Google 授权页完成后要回到
+        // `http://localhost:{port}/oauth-callback`（redirect_uri 由适配器在发起
+        // 登录时本地拼），端口必须在第一次发起之前就位（见该模块 `set_loopback_port`）。
+        crate::server::core::providers::antigravity::oauth::set_loopback_port(port);
         let config_dir = config::config_dir();
         // 与 Node 版一致：verbose 由环境变量 AGENT2API_VERBOSE=1 打开
         // （旧名 WORKBUDDY_VERBOSE 仍可读，新名优先），
@@ -314,6 +330,27 @@ impl ServerState {
             Ok(db) => Some(db),
             Err(error) => {
                 logging::console_line("[Storage]", &format!("❌ 数据库打开失败: {error}"));
+                // ── 唯一的例外：库版本**高于**本程序 → 明确拒绝启动 ────────────
+                // 这几乎必然是「用户回退到了旧版本」。旧程序读不懂加密后的
+                // `accounts.data`（会把每一行当坏数据跳过），而它的 `save_state`
+                // 会把「读不出来 = 内存里没有」的行 DELETE —— 即「回退一次 =
+                // 账号被删」（完整论证见 `db::schema::migrate` 的拒绝分支）。
+                // 降级继续会让用户看到「服务正常起来了、账号却全报错」，那不是
+                // 「明确拒绝降级」；所以这里直接返回 Err 让启动失败。
+                //
+                // **只加这一个分支**：其余任何 DB 打开失败（磁盘满、权限、库损坏）
+                // 一律保持下面原有的降级行为（`db = None` 继续启动，理由见
+                // `ServerState.db` 字段注释与 `db` 模块头）。判据必须来自
+                // `Db::open` 之外的一次独立读取：`Db::open` 已经失败、没有句柄可用。
+                if let Some(stored) = db::stored_schema_version(&db_path) {
+                    if stored > db::schema::SCHEMA_VERSION {
+                        return Err(format!(
+                            "库 schema 版本（{stored}）高于当前程序（{}）：这通常是回退到了旧版本。\
+                             请使用更新版本的程序，或从备份恢复——用旧程序打开会把加密后的账号静默删除。",
+                            db::schema::SCHEMA_VERSION,
+                        ));
+                    }
+                }
                 None
             }
         };
@@ -323,12 +360,69 @@ impl ServerState {
         // 结果 —— 老用户升级后第一次启动拿到的就是他真正的旧配置，
         // 下面日志裁剪天数与旧文件候选目录才不会用错值。
         let snapshot = config::init(db.clone());
+        core::task_state::install(db.clone());
+        // 每账号的余额查询记录（余额不足跳过 / 自动禁用的底座）：装库句柄时
+        // 顺带做旧 kv 快照的一次性迁移与内存事实表的装载（见 usage_records 模块头）。
+        core::usage_records::install(db.clone());
+        // 签到记录的明细台账（签到中心「签到记录」页）：装句柄即可，记账点在
+        // `core::billing::checkin::run_checkin`（唯一），台账全量保留 ——
+        // 清历史走签到记录页自己的「清空 / 按筛选删除」（见 checkin_records 模块头）。
+        core::checkin_records::install(db.clone());
+        // 定时签到的「签到范围」一次性补齐：把加入版本晚于配置里那一版的家补进
+        // 每条条目的范围（用户的期望是 OfficeAce 果办 / CodeArts 默认开启）。
+        // 放在这里是因为它要读写配置快照（`config::init` 已在上方就位），且必须早于
+        // 第一次 `/api/checkin-schedules` —— 界面读到的就该是补过的清单。
+        // 只补一次：版本写上去之后，用户取消勾选就真的生效了。
+        if core::checkin_schedules::extend_providers_once() {
+            logging::console_line(
+                "[Checkin]",
+                "已把新加入的签到提供商补进定时条目的签到范围（OfficeAce 果办 / CodeArts）",
+            );
+        }
+        // 每账号的「限制器」（余额 / Token 规则列表）：Token 周期消耗的窗口
+        // 聚合读同一个库（schema v9 的聚合索引），装句柄即可 —— 事实表的刷新
+        // 由 usage_query 的心跳循环驱动（见 limiter 模块头）。
+        core::limiter::install(db.clone());
+        // 出网代理池（「网络代理」页维护的命名代理；账号按 id 引用它们）：
+        // 与任务状态同为「kv 固定键 + 整份读写」的形态，把同一个 `Db` 传进去。
+        // 它不参与启动预热，位置只要求早于任何一次 `/api/proxies/pool*` 请求。
+        core::proxy_pool::install(db.clone());
+        // 代理设置（节点监听端口范围 + 出口测试网址，「网络代理」页的设置
+        // 弹窗）：与 proxyPool 同一形态的 kv 固定键。内核端口分配与出口
+        // 测试在运行期直接读它，位置只要求早于第一次内核启动 / 测试请求。
+        core::proxy_settings::install(db.clone());
+        // 订阅存储（「订阅管理」维护的订阅链接）：同一个 `Db`（与 proxyPool
+        // 同一形态）。位置只要求早于任何一次 `/api/subscriptions*` 请求。
+        core::subscriptions::install(db.clone());
+        // 订阅内核（mihomo sidecar）的命令 worker：单条队列串行消费内核操作
+        // （下载 / 重建配置 / 重启 / 停止），见 `core::sub_kernel` 的模块头。
+        core::sub_kernel::spawn_worker();
+        // 内核已安装且有启用的订阅 → 自动拉起（清理上次运行遗留的进程后
+        // 重建配置）。**未安装时不自动下载**：二进制 ~20-40MB，下载必须有
+        // 用户的手势（界面上的「下载内核」按钮），启动时静默拉网不合适。
+        if core::subscriptions::should_autostart() {
+            let providers = core::subscriptions::enabled_provider_inputs();
+            crate::spawn_task(async move {
+                core::sub_kernel::request_restart(providers);
+            });
+            logging::console_line("[Subscription]", "检测到已安装的代理内核与启用的订阅，后台自动拉起");
+        }
         // 模型清单的持久化缓存：把**同一个 `Db`** 传进去（与配置 / 日志库 /
         // 账号库同一形态）。各家的远程清单在进程重启后由它读回，不再回落到
         // 内置清单（见 `core::providers::catalog_cache` 的模块头）。
         // 位置必须在这里：它得早于下面那次 `restore_cached_catalogs` 预热 ——
         // 各家的目录句柄首次初始化时才读缓存，句柄先被碰到就再也读不回来了。
         core::providers::catalog_cache::install(db.clone());
+        // OfficeAce 模型可用性探测的结论也落同一个库（kv 的 `officeaceModelProbe`
+        // 键）：目录刷新后探一轮、把「这个号打不通」的模型从对外清单里收窄掉。
+        // 与 catalog_cache 同一形态（kv 固定键 + 整份读写），位置只需早于
+        // 第一次 `advertise_models`（那是纯读，未 install 时给空结论 = 不藏）。
+        core::providers::officeace::probe::install(db.clone());
+        // models.dev 模型元数据（能力位 / 思考档位）的刷新结果也落同一个库
+        // （kv 的 `modelsDevCatalog` 键）。与 catalog_cache 同一形态：未 install
+        // 时只读内嵌快照（功能仍在，只是拿不到上次的刷新结果），所以位置不敏感；
+        // 放在这里是为了和另外两个 kv 使用者排在一起，便于核对「谁在用这个库」。
+        core::model_meta::install(db.clone());
         // ── 旧文件一次性迁移：**本切片起不再自动跑** ────────────────
         // 它现在由用户在升级弹窗里点「升级」触发（`POST /api/upgrade/run`）。
         // 为什么改成手动：需求是「弹窗告诉用户换了 SQLite，点升级才开始导」——
@@ -397,16 +491,22 @@ impl ServerState {
         // 的其余部分（日志、模型目录、健康检查、配置页）不依赖账号，让它们继续
         // 可用比整体拒绝启动更有用 —— 用户能在界面上看到那条 ❌ 日志并处理磁盘问题。
         let store = AccountStore::with_db(db.clone());
+        // 账号存储句柄给订阅内核（lazy listeners：内核 runtime 读「哪些订阅节点
+        // 需要监听器」决定给谁开 —— 账号引用 ∪ 被「测试」钉住的节点，见
+        // `sub_kernel::runtime::listener_node_keys`）。AccountStore 是轻量 Arc
+        // 句柄，clone 与 ServerState 里那份同实例。
+        core::sub_kernel::install_store(Some(store.clone()));
         let context = core::endpoints::default_context();
         let auth = AuthService::new(store.clone(), context);
         let login = LoginService::new(auth.clone(), store.clone());
         let billing = BillingService::new(auth.clone());
-        // 模型目录：**进程级单例**（Agent2API 改造 W2a-T2）。聚合模型目录
-        // （core::providers::catalog）只收 &AccountStore，不该让调用方层层传目录，
-        // 因此目录自身也做成进程级句柄（与 config / auto_checkin
-        // 同一模式）：`core::models::global_catalog()` 与这里的 `models` 是
-        // **同一实例**（共享同一把 RwLock），刷新对两边同时可见。
-        let models = core::models::global_catalog();
+        // 模型目录：**进程级单例，按地区各一份**（Agent2API 改造 W2a-T2；
+        // WorkBuddy 拆家后国内版与国际版各持一份，见 `core::models` 模块头）。
+        // 聚合模型目录（core::providers::catalog）只收 &AccountStore，不该让
+        // 调用方层层传目录，因此目录自身也做成进程级句柄（与 config /
+        // auto_checkin 同一模式）：`core::models::global_catalog(region)` 与
+        // 这里的 `models` 是**同一实例**（共享同一把 RwLock），刷新对两边同时可见。
+        let models = core::models::global_catalog(core::providers::workbuddy::Region::Cn);
         // 恢复各家的持久化清单缓存：各家的目录句柄在这一步**首次初始化**
         // （`OnceLock`），缓存也只在这一刻读得回来（见 `providers::catalog_cache`
         // 的模块头）。必须在上面那次 `install` 之后 —— 句柄先被别处碰到的话，
@@ -433,11 +533,10 @@ impl ServerState {
         // `requestStatsDir` 这个键仍被迁移项读（去自定义目录里找那两个旧文件，
         // 见 `db::migrate::requests`），本文件不再碰它。
         //
-        // 保留期走**回调**，每次裁剪时动态读配置：明细天数来自
-        // `requestRetentionDays`、聚合天数来自 `dailyRetentionDays`
-        // （`config::retention_settings()` 读的是 config::init() 装好的内存快照，
-        // 而 `PUT /api/retention` 会同步刷新它）——
+        // 保留期回调读**内存快照**（`config::retention_settings()`）而不是每次读盘：
+        // 记账是每个请求一次的热路径，而 `PUT /api/retention` 会同步刷新快照 ——
         // 于是设置页改完天数，下一次记账 / prune 立即生效，**不需要重启进程**。
+        // 两档默认都是 99999 天（约 274 年，近似全量保留），用户改小即生效。
         let request_stats = Arc::new(RequestStats::with_db(db.clone(), || {
             let settings = config::retention_settings();
             Retention {
@@ -487,6 +586,7 @@ impl ServerState {
             port,
             panel_port: None,
             host,
+            local_panel: false,
             config_dir,
             ui_dir: None,
             store,
@@ -606,11 +706,25 @@ impl ServerState {
             // spawn 一次 `refresh_implemented`（对照 Node 的
             // `void refreshModelCatalog()`），那个行为在开关默认开启时保持不变。
         } else {
-            let reason = summary
-                .get("unavailableReason")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(core::auth::UNCONFIGURED_REASON);
-            logging::log("[Init]", &format!("⚠️  暂无可用登录态: {reason}"));
+            // 「旧式单账号登录态没配」与「一个账号都没有」是两件事：前者在多账号
+            // （agent2api.db）部署里完全正常 —— 账号都在库里，跟 WorkBuddy 的
+            // auth.json 没关系。照旧无条件打警告，就会与上一行 `[Accounts] 账号列表: …`
+            // 自相矛盾，每次启动都报一条假警告（issue #178）。
+            let available = available_account_count(&state);
+            if available > 0 {
+                logging::log(
+                    "[Init]",
+                    &format!(
+                        "多账号模式：{available} 个账号可用（WorkBuddy 单账号登录态未配置）"
+                    ),
+                );
+            } else {
+                let reason = summary
+                    .get("unavailableReason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(core::auth::UNCONFIGURED_REASON);
+                logging::log("[Init]", &format!("⚠️  暂无可用登录态: {reason}"));
+            }
         }
 
         // 定时签到：开启时起调度，今天还没签且时间点已过则补签一次
@@ -655,6 +769,16 @@ impl ServerState {
         // 服务器停机时进程会结束，任务随之消失。用 crate::spawn_task
         // （与 auto_checkin 同一理由）保证从非 tokio 上下文调用也能进入全局运行时。
         core::scheduled_tasks::spawn(state.store.clone(), state.update.clone());
+        // ZCode 活动套餐的「推理要不要验证码令牌」由上游配置说，每 5 分钟同步一次
+        // （判据、代价与三条口径见 `providers::zcode::config_sync` 的模块头）。
+        // 不进上面那张定时任务表：它没有「用户可配的间隔」、也不产生任何运行状态
+        // 要展示，硬塞进去只会多一条没人会去动的设置行。
+        core::providers::zcode::config_sync::spawn(state.store.clone());
+
+        // 每账号自动余额查询的心跳循环：与上面的间隔型任务同一形态（一个进程
+        // 一个循环，到点判定全在「记录 + 配置」上），只是排期按账号各自算，
+        // 不再是全局任务（见 `core::usage_query` 的模块头）。
+        core::usage_query::spawn_sweeper(state.store.clone());
 
         Ok(state)
     }
@@ -770,6 +894,23 @@ fn env_flag(names: &[&str]) -> bool {
         }
     }
     false
+}
+
+/// 多账号库里**可用**的账号数（`available` = 启用且凭证完整）。
+///
+/// 判据与账号页、选路读的是同一份事实（`account_store::store_view` 的
+/// `public_account` 写这个键），所以这里不自己拼「启用 + 有凭证」两条件 ——
+/// 那是判据的第三份实现，迟早与前端徽章、选路口径分叉。
+///
+/// 用在启动横幅：多账号模式下一个可用账号都没有，与「旧式单账号登录态没配」
+/// 才该报同一条警告（issue #178）。
+fn available_account_count(state: &ServerState) -> usize {
+    core::routing::accounts_of(&state.store.list_accounts())
+        .iter()
+        .filter(|account| {
+            account.get("available").and_then(serde_json::Value::as_bool) == Some(true)
+        })
+        .count()
 }
 
 /// 启动进程内服务器：同步 bind（失败立刻返回可读错误）+ 异步 serve。

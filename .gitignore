@@ -24,9 +24,8 @@ desktop-tauri/web
 logs/
 desktop-tauri/window-shot.png
 
-# 发布说明草稿（只用于发布 Release，不入库）
-.release-notes-*.md
-docs/
+# 发布说明草稿只在本机留存，不入库；docs/ 下的其它文档正常入库
+/docs/release-notes/
 
 # 发版脚本下载的 CI 构建产物（scripts/release.sh）
 dist/

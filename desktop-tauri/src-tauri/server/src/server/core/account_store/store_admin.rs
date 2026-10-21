@@ -374,6 +374,42 @@ impl AccountStore {
             .is_ok()
     }
 
+    /// 记下「这个账号的新手任务（一次性福利）已全部结算」的快照
+    /// （账号记录上的 `onboardingSettled`；形状与读法见
+    /// [`StoredAccount::set_onboarding_settled`] 与
+    /// `crate::server::core::providers::onboarding_memory`）。
+    ///
+    /// 与 `mark_checkin` / `mark_onboarding_grant_batch` 同一口径：账号级事实、
+    /// 低频写、写盘失败不致命（返回 bool；上游那边奖励已经结清，调用方最多记
+    /// 一条日志）。**不**动 updatedAt（理由同上）。
+    ///
+    /// 形状校验只到「对象或 Null」为止：对象 = 写入（内容是各家自己的任务行
+    /// `{at, tasks, earned, total}`，这里不做跨家白名单 —— 唯一调用方就是那几家
+    /// 的 onboarding 模块，键名在那边随任务表定义）；**Null = 清除**（上游出了
+    /// 新一期活动之类的新事实时，记忆失效要能抹掉，读侧把 Null 当「没有」）。
+    /// 其余形态（数组 / 字符串 / 数字）整批拒绝，免得往账号记录里塞进读不出来的
+    /// 脏值。
+    ///
+    /// 与现存值相同时（含「本来就没什么可清」的 Null）**直接返回 true，不写库**：
+    /// 没领完的账号每次状态查询都会带着 `unclaimed > 0` 走到「清除」那一步，
+    /// 值没变也写一次盘是纯浪费 —— 这条链真正要写的只有结算那一次。
+    pub fn mark_onboarding_settled(&self, id: &str, snapshot: Value) -> bool {
+        if !(snapshot.is_object() || snapshot.is_null()) {
+            return false;
+        }
+        let _guard = self.guard();
+        let Some(mut record) = self.record_by_id(&_guard, id) else {
+            return false;
+        };
+        let existing = record.fields().get("onboardingSettled");
+        if existing == Some(&snapshot) || (snapshot.is_null() && existing.is_none()) {
+            return true;
+        }
+        record.set_onboarding_settled(snapshot);
+        self.with_conn(&_guard, |conn| sql::update_in_place(conn, &record))
+            .is_ok()
+    }
+
     // ─── 迁移 ────────────────────────────────────────────────
 
     /// 启动时的一次性数据迁移（**唯一入口**，bootstrap 只调它）。
@@ -436,10 +472,34 @@ impl AccountStore {
         // 它改的是 id，而 ②③ 的整队要按**旧** id 分组看
         let cline_renamed = Self::migrate_cline_accounts(&mut state);
 
+        // ⑤ WorkBuddy 国际版拆家（见 `migrate_workbuddy_intl_accounts`）。
+        // 只改 `provider`、**不改 id**，因此放在 ②③ 之后没有顺序约束；
+        // 排在 Cline 之后只是让「拆家类迁移」聚在一起。
+        let workbuddy_moved = Self::migrate_workbuddy_intl_accounts(&mut state);
+
+        // ⑥ Qoder 国际版拆家（见 `migrate_qoder_intl_accounts`）：与 ⑤ 同款，
+        // 只改 `provider`、不改 id（Qoder 的 id 本来就带地区段）。
+        let qoder_moved = Self::migrate_qoder_intl_accounts(&mut state);
+
+        // ⑦ OfficeAce 账号名自愈（见 `officeace_accounts::heal_names_from_stored_tokens`）：
+        // 存量记录的 name 曾是十六进制的 account_id/principal_id，而显示名一直躺在**同一行**
+        // 的 refreshToken 里 —— 这里零网络地把它解出来补上，不等续期、不碰那枚一次性令牌。
+        let officeace_named =
+            super::officeace_accounts::heal_names_from_stored_tokens(&mut state.accounts);
+        if officeace_named > 0 {
+            logging::log(
+                "[Accounts]",
+                &format!("🏷️  已按登录态为 {officeace_named} 个 OfficeAce 账号补回上游显示名"),
+            );
+        }
+
         if provider_added == 0
             && assignments.is_empty()
             && !scope_migrated
             && cline_renamed == 0
+            && workbuddy_moved == 0
+            && qoder_moved == 0
+            && officeace_named == 0
         {
             return json!({
                 "providerAdded": 0,
@@ -468,6 +528,24 @@ impl AccountStore {
                 ),
             );
         }
+        if workbuddy_moved > 0 {
+            logging::log(
+                "[Accounts]",
+                &format!(
+                    "🔀 WorkBuddy 已拆为国内版 / 国际版两家，{workbuddy_moved} 个国际版账号已归位\
+                     （凭证、优先级、限流记录与账号 id 均未改动）"
+                ),
+            );
+        }
+        if qoder_moved > 0 {
+            logging::log(
+                "[Accounts]",
+                &format!(
+                    "🔀 Qoder 已拆为中国版 / 国际版两家，{qoder_moved} 个国际版账号已归位\
+                     （凭证、优先级、限流记录与账号 id 均未改动）"
+                ),
+            );
+        }
         if !assignments.is_empty() {
             logging::log(
                 "[Accounts]",
@@ -493,6 +571,53 @@ impl AccountStore {
                 }))
                 .collect::<Vec<_>>(),
         })
+    }
+
+    /// 把历史明文账号行**整列加密**落库（幂等，可重复调用）。
+    ///
+    /// ── 它补的是什么 ────────────────────────────────────────────
+    /// 本轮改造起 `accounts.data` 写的是 `enc1:` 密文（见 `sql.rs` 模块头），但
+    /// **升级前已经写进库的行**仍是明文 JSON。`sql::decode_data` 兼容明文，那些行
+    /// 照常能读 —— 那是过渡期的安全网，不是最终形态：只要还有明文行，拷走库文件
+    /// 就带走全部凭证。所以启动时补一次「就地加密」，把过渡态收敛掉。
+    ///
+    /// ── 为什么排位在 `migrate_startup` 之后（见 `account_bootstrap::run`）────
+    /// 那一轮会按差异重写改了字段的行（补 provider、整队、拆池改名…），写出的
+    /// 已经是密文；剩下没被它碰到、仍是明文的历史行由本函数收尾。反过来的顺序
+    /// 也能得到同一结果（`decode_data` 两种都读得出来），排后面只是让「先做语义
+    /// 迁移、再做形态迁移」这条读起来更顺。
+    ///
+    /// ── 幂等与失败语义都由 SQL 层承担 ───────────────────────────
+    /// 判据是数据自证（`sql::encrypt_legacy_rows` 逐行看 `data` 是不是 `enc1:`），
+    /// 没有 kv 标记；整批在一个事务里，要么全成、要么一行都不动。**失败不阻断
+    /// 启动**：密钥文件建不出来之类的失败在这里只记一条日志、返回，下次启动重试
+    /// —— 而因为 `decode_data` 兼容明文，本次账号照常可用，绝不把用户挡在门外。
+    pub fn encrypt_legacy_accounts(&self) {
+        let _guard = self.guard();
+        // 用 `with_conn_mut` 而不是 `with_conn`：整批加密要在一个事务里
+        // （见 `sql::encrypt_legacy_rows` 的说明），而事务需要可变的连接借用。
+        match self.with_conn_mut(&_guard, |conn| sql::encrypt_legacy_rows(conn)) {
+            // 0 条 = 库里没有明文行（全新库 / 已迁过的库），不记日志
+            Ok(0) => {}
+            Ok(count) => {
+                logging::log(
+                    "[Accounts]",
+                    &format!("🔒 已加密 {count} 个历史账号的凭证"),
+                );
+            }
+            Err(error) => {
+                // 这条日志必须在 `with_conn_mut` **之外**打：记日志本身要写库
+                // （logs 表），而 `with_conn_mut` 持着那条唯一的数据库连接 ——
+                // 在它内部再记日志就是「自己等自己」的硬死锁（`std` 的 Mutex
+                // 不可重入，release 构建还是 panic=abort）。
+                logging::log(
+                    "[Accounts]",
+                    &format!(
+                        "⚠️  历史账号凭证加密未完成（下次启动会自动重试，本次账号照常可用）: {error}"
+                    ),
+                );
+            }
+        }
     }
 
     /// Cline 拆池改名：`provider: "cline"` + `pool` 字段 → 两家里的某一家，
@@ -553,6 +678,86 @@ impl AccountStore {
             renamed += 1;
         }
         renamed
+    }
+
+    /// WorkBuddy 国际版拆家：把 `provider == "workbuddy"` 且 `edition == "intl"`
+    /// 的记录归到 `workbuddy-intl`（2026-10，见 `providers::workbuddy::region`）。
+    ///
+    /// ── 为什么不改 id（与 `migrate_cline_accounts` 的差别）──────────
+    /// Cline 那次必须改 id：两个池共用 `cline-...` 的 id 空间，不拆就分不开。
+    /// 本家不需要 —— 两个地区的 uid 是各自上游生成的 uuid，不会撞；而 id 是
+    /// `requests.account_id` 与 `request_daily` 的引用键，改名会让用户在请求
+    /// 日志与报表里再也对不上自己那个账号（详见 `Region` 模块头那段论证）。
+    ///
+    /// ── 判据为什么是 `edition` 而不是账号别的字段 ────────────────
+    /// 拆家前「账号属于哪个地区」这件事**只有** `edition` 一个表达（端点、
+    /// UA、登录站点全部由它派生），所以它就是这次迁移的全部依据。
+    /// `edition` 缺失（旧数据 / 手改）一律按国内版 —— 与 `resolve_edition`
+    /// 的兜底同口径（`StoredAccount::edition()` 返回 None，这里不动它）。
+    ///
+    /// ── 幂等 ────────────────────────────────────────────────────
+    /// 判据是数据本身（`provider == workbuddy && edition == intl`）：迁完就没有
+    /// 这样的记录，再跑一遍返回 0、不写库。与 `migrate_startup` 的其它步骤
+    /// 同一原则（见 `db::migrate` 模块头「数据自己有没有」那段）。
+    fn migrate_workbuddy_intl_accounts(state: &mut AccountState) -> usize {
+        /// 拆家前的唯一 WorkBuddy provider id（只出现在这里）
+        const LEGACY_WORKBUDDY_ID: &str = "workbuddy";
+        let mut moved = 0usize;
+        for record in state.accounts.iter_mut() {
+            if record.provider() != LEGACY_WORKBUDDY_ID {
+                continue;
+            }
+            let region = crate::server::core::providers::workbuddy::Region::from_edition_id(
+                record.edition().as_deref(),
+            );
+            let provider = region.provider_id();
+            if provider == LEGACY_WORKBUDDY_ID {
+                continue;
+            }
+            record.set_provider(provider);
+            moved += 1;
+        }
+        moved
+    }
+
+    /// Qoder 国际版拆家：把 `provider == "qoder"` 且地区为国际版的记录归到
+    /// `qoder-intl`（2026-10，见 `providers::qoder::endpoints` 的模块头）。
+    ///
+    /// ── 判据：记录里的地区，而不是 id 前缀 ─────────────────────
+    /// 拆家前「这个账号属于哪个地区」由记录的 `mode`（兜底 `edition`）字段
+    /// 表达（`Region::from_payload` 的读取口径）。id 虽然也带地区段
+    /// （`qoder-global-…` / `qoder-cn-…`），但那是生成时的快照，记录的权威
+    /// 表达一直是凭证字段 —— 与 WorkBuddy 拆家「判据是 edition」同一取舍。
+    ///
+    /// ── 为什么不改 id（与 `migrate_cline_accounts` 的差别）────────
+    /// Qoder 的 id 生成时已含地区段，两地区的 id 空间天然不相交（同 WorkBuddy
+    /// 拆家的论证）；而 id 是 `requests.account_id` 与请求报表的引用键，改名
+    /// 会让历史记录对不上账号。
+    ///
+    /// ── 幂等 ────────────────────────────────────────────────────
+    /// 判据是数据本身（`provider == qoder && 地区 == 国际`）：迁完就没有
+    /// 这样的记录，再跑一遍返回 0、不写库。
+    fn migrate_qoder_intl_accounts(state: &mut AccountState) -> usize {
+        /// 拆家前的唯一 Qoder provider id（只出现在这里）
+        const LEGACY_QODER_ID: &str = "qoder";
+        let mut moved = 0usize;
+        for record in state.accounts.iter_mut() {
+            if record.provider() != LEGACY_QODER_ID {
+                continue;
+            }
+            let Some(region) =
+                crate::server::core::providers::qoder::endpoints::Region::from_payload(
+                    &record.to_value(),
+                )
+                .ok()
+                .filter(|region| *region == crate::server::core::providers::qoder::endpoints::Region::Global)
+            else {
+                continue;
+            };
+            record.set_provider(region.provider_id());
+            moved += 1;
+        }
+        moved
     }
 
     /// 全局重新连续编号，**原地改 state**（不落盘）。
@@ -670,7 +875,14 @@ impl AccountStore {
             "platform": legacy.get("platform").cloned().unwrap_or(Value::Null),
             "edition": legacy.get("edition").cloned().unwrap_or(Value::Null),
         });
-        match self.add_account(&payload, nickname.as_deref()) {
+        // 旧登录态（`auth.json`）是单上游时代的产物：那时进程只有一个上游，
+        // 地区由 `WORKBUDDY_EDITION` 决定，因此这里**按 payload 里的 edition
+        // 归位**（缺失回落国内版，历史行为不变）。
+        let provider = crate::server::core::providers::workbuddy::Region::from_edition_id(
+            payload.get("edition").and_then(Value::as_str),
+        )
+        .provider_id();
+        match self.add_account(&payload, nickname.as_deref(), Some(provider)) {
             Ok(account) => Some(account),
             Err(error) => {
                 logging::log("[Accounts]", &format!("❌ 旧登录态迁移失败: {error}"));

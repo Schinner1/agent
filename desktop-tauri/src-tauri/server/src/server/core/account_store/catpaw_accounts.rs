@@ -37,11 +37,10 @@ use serde_json::{Map, Value};
 
 use crate::server::core::account_store::priority::next_free_priority;
 use crate::server::core::account_store::sql;
-use crate::server::core::account_store::state::StoredAccount;
+use crate::server::core::account_store::state::{mark_name_custom, StoredAccount};
 use crate::server::core::account_store::store::{AccountStore, AccountStoreError};
 use crate::server::core::account_store::store_util::{
-    js_string, max_concurrent_public, object_or_empty, strip_bearer_prefix, token_tail_of,
-    truncate_chars,
+    js_string, object_or_empty, strip_bearer_prefix, token_tail_of, truncate_chars,
 };
 use crate::server::core::account_store::MAX_TOKEN_LENGTH;
 /// 余额凭证字段名（定义在 `providers::catpaw::balance`：那里是消费方，
@@ -207,6 +206,7 @@ impl AccountStore {
             .filter(|value| !value.is_empty())
             .map(|value| truncate_chars(value, MAX_NAME_LENGTH));
         // 备注名兜底照抄原项目：显式传入 → 记录里的 name → loginName → uid
+        let explicit = explicit_name.is_some();
         let record_name = explicit_name
             .or_else(|| {
                 existing
@@ -237,6 +237,7 @@ impl AccountStore {
         record.insert("id".to_string(), Value::String(id.clone()));
         record.insert("provider".to_string(), Value::String(catpaw_id().to_string()));
         record.insert("name".to_string(), Value::String(record_name.clone()));
+        mark_name_custom(&mut record, explicit, existing.as_ref());
         record.insert("uid".to_string(), Value::String(uid));
         record.insert("loginName".to_string(), Value::String(login_name));
         record.insert("accessToken".to_string(), Value::String(token.clone()));
@@ -302,7 +303,7 @@ impl AccountStore {
             "[Accounts]",
             &format!("✅ CatPaw 账号已保存: {record_name}（{id}，优先级 {priority}）"),
         );
-        Ok(self.to_catpaw_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     /// 导入/刷新「桌面端实时登录态」账号（`importDesktop: true` 与启动导入共用）。
@@ -432,7 +433,7 @@ impl AccountStore {
                 if is_new { "已导入" } else { "已刷新" },
             ),
         );
-        Ok(self.to_catpaw_public_account(&saved))
+        Ok(self.public_account(&saved))
     }
 
     // ─── 会话失效（账号切换语义，架构文档 §9.3）──────────────────
@@ -566,12 +567,6 @@ impl AccountStore {
                     .map(|value| !value.trim().is_empty())
                     .unwrap_or(false),
             ),
-        );
-        // 单账号并发上限（所有家通用，兜底共用 `max_concurrent_public`）：
-        // 0 = 不限，缺键同样输出 0
-        public.insert(
-            "maxConcurrent".to_string(),
-            Value::from(max_concurrent_public(record.get("maxConcurrent"))),
         );
         Value::Object(public)
     }

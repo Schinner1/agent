@@ -26,7 +26,7 @@
 //! 用 `OnceLock<HashMap<…>>` 反而要处理「注册表还没装好时被调用」的路径，
 //! 而那条路径在 panic=abort 的 release 里只能 panic —— 得不偿失。
 //!
-//! ── 契约之外的十处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
+//! ── 契约之外的十一处扩展（都是带默认实现的加法，不改 §4.2 的方法）──
 //!   1. `retry_advice`：识别「可退避重试的错误」并给出间隔与日志文案。
 //!      §4.3 要求「11128 退避逻辑保持在转发层」——**循环**留在编排层，
 //!      但「哪个码要退避、退多久」是 provider 知识（11128 是 workbuddy 的
@@ -46,17 +46,19 @@
 //!      通用层不出现任何 provider 分支 —— 与 `retry_advice` 同一分工。
 //!   5. `supports_refresh` + `credentials_expiring`（凭证自动维护）：
 //!      「这家能不能主动续期」「这个账号的凭证此刻算不算临期」是**各家的知识**
-//!      （过期时间在哪个字段、用什么窗口，四家各不相同），因此由适配器回答，
+//!      （过期时间在哪个字段、用什么窗口，各家各不相同），因此由适配器回答，
 //!      维护任务（`core::credential_maintenance`）只负责遍历与调用。
 //!      放在这里而不是壳侧：壳侧只能按账号公开形态里的字段名判断，而那个字段名
-//!      四家不同（小浣熊的过期时间在 `tokenExpiresAt`，公开形态里没有 `expiresAt`）
+//!      各家不同（小浣熊的过期时间在 `tokenExpiresAt`，公开形态里没有 `expiresAt`）
 //!      —— 写死一个名字就会让别家的账号永远被判成「无需刷新」。
 //!      契约：**判不出来就返回 false**（没有过期信息 / 账号不存在），
 //!      宁可漏刷也不要凭猜测去打上游。
 //!   6. `is_stateful` + `forward_conversation`（W4a 加钩子，W5-T-d4 接上消费方，
 //!      架构文档 §4.2.1）：本 provider 的上游是不是**多步会话协议**
 //!      （CatPaw 是：round → turn → 工具循环 → completed）。默认 false；
-//!      当前唯一的 true 是 `catpaw::CatPawAdapter`。`forward_conversation` 是
+//!      覆写成 true 的是走会话式转发（`forward_conversation`）的家（CatPaw /
+//!      Qoder / Accio / CodeArts / Trae / Kuku / MonkeyCode，见各自 `mod.rs`
+//!      的模块头）。`forward_conversation` 是
 //!      会话式转发的入口（默认 503，只有有状态 provider 覆写），编排层的
 //!      `provider_loop` 按 `is_stateful` 分流到它 —— 分流落地后本文件不再需要
 //!      任何死代码抑制。
@@ -72,7 +74,7 @@
 //!      凭证、落账号走哪条添加路径」全是 provider 知识，与 `sse_model_rewrite`
 //!      同一性质；路由层只该回答「这家支不支持」，不该认识小浣熊的字段名。
 //!   8. `supports_usage` + `query_usage`（余额 / 积分查询）：「这家有没有余额概念」
-//!      「这个账号的余额怎么查」是 provider 知识（四家的接口地址、鉴权头、
+//!      「这个账号的余额怎么查」是 provider 知识（各家的接口地址、鉴权头、
 //!      凭证来源全不相同：workbuddy 走腾讯计费接口、小浣熊要 Bearer JWT、
 //!      CatPaw 要网页会话 cookie `token2`、AutoClaw 走带签名的 userapi 域），
 //!      所以由适配器回答，`api::accounts` 只负责并发调度与单账号失败的收敛。
@@ -81,8 +83,9 @@
 //!      统一形状的契约写在 [`ProviderAdapter::query_usage`] 的文档里。
 //!   9. `supports_model_refresh` + `refresh_models(force)`（「刷新模型清单」）：
 //!      「这家有没有远程目录可拉」与「这次要不要绕过缓存」是两件事，拆成两个
-//!      入口（前者恒定能力，后者单次语义）。**五家现在都覆写成 true** ——
-//!      每家都有远程目录：WorkBuddy `GET /v3/config`、小浣熊
+//!      入口（前者恒定能力，后者单次语义）。**现在各家都覆写成 true** ——
+//!      每家都有远程目录（下列是早期五家的接口，后来接入的家见各自
+//!      `models.rs` 的模块头）：WorkBuddy `GET /v3/config`、小浣熊
 //!      `GET {llmBase}/model_catalog`、Qoder `GET {gateway}algo/api/v2/model/list`、
 //!      CatPaw `POST /api/agent/maas/model-types`、AutoClaw
 //!      `GET .../proxy/autoclaw-model-config`。
@@ -100,9 +103,20 @@
 //!      编排层（`upstream::payload`）只负责在正确的时机问一次、按结果改写 body。
 //!      **默认实现是「不接」**（返回 `NotSupported`）—— 理由见那个方法的文档：
 //!      接一家要有一家的证据，没证据就注入等于把未知参数推给上游。
+//!  11. `sse_strip_newline_chunks`（下发帧丢掉「整片只有换行」的 content 分片）：
+//!      WorkBuddy 与 AutoClaw 的上游会在相邻正文分片之间插一帧纯换行的 content
+//!      （那是它们的保活节拍，两天样本里 34.5% 的请求带、脏请求中位占正文分片
+//!      13.4%，见 `upstream::sse` 模块头）。丢不丢是 provider 知识 —— 同样的帧在别家
+//!      可能真是模型写的换行，所以由适配器回答，执行落在 `upstream::sse` 这个
+//!      SSE 逐行解析的唯一出口（与 `sse_model_rewrite` 同一分工、同一位置）。
+//!      **默认 false**：没声明的 provider 下发帧逐字节不变。
+//!      声明了也不等于会丢 —— 还要 `stripNewlineKeepalive` 这个**部署开关**开着
+//!      （默认关，见 `config::KEY_STRIP_NEWLINE_KEEPALIVE`）：能力位回答"这家的
+//!      上游会不会发"，开关回答"这台机器要不要为它改字节"，两者相与，且开关只能
+//!      收窄不能扩张（见 `upstream::sse::FramePolicy::assembled`）。
 //!
 //! ── 未注册的 provider 怎么办 ────────────────────────────────
-//! 四家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
+//! 各家 provider 在 [`adapter_for`] 里各自接上真身，那个 match 是穷举的：
 //! 加新 kind 时编译器强制在这里给出分支，「注册了 provider 却忘了接线」的
 //! 情形在编译期就被拦住。过渡期曾用它返回一个占位适配器
 //! （`pending::PendingAdapter`，W4a–W5 期间 CatPaw / AutoClaw 借它顶着，
@@ -111,14 +125,14 @@
 //! 校验里：`/v1/models` 不会广告清单为空的那家。
 
 use axum::http::HeaderMap;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::server::core::account_store::AccountStore;
 use crate::server::errors::GatewayError;
 
 use super::qoder;
 use super::raccoon;
-use super::{catalog_cache, kind_id, meta, ProviderKind};
+use super::{catalog_cache, ProviderKind};
 
 /// 转发前对「账号 + 请求体」的完整构造计划（架构文档 §4.2 的 ChatRequestPlan）。
 ///
@@ -135,6 +149,104 @@ pub struct ChatRequestPlan {
     pub headers: Vec<(String, String)>,
     /// 已按 provider 规则改写过的请求体
     pub body: Value,
+    /// 上游**响应**说的是哪套协议（默认 [`UpstreamResponse::Chat`]）
+    pub response: UpstreamResponse,
+}
+
+impl ChatRequestPlan {
+    /// 标准形态：上游说 OpenAI Chat（请求体与响应帧都是 chat 形态）。
+    ///
+    /// 绝大多数内置上游（以及自定义家）都是这一种；三处例外各有一个专用
+    /// 构造器：ZCode 的活动套餐通道说 Anthropic（[`UpstreamResponse::Anthropic`]）、
+    /// Command Code 说 NDJSON（[`UpstreamResponse::CommandCodeNdjson`]）、
+    /// Antigravity 说 Gemini v1internal 信封
+    /// （[`UpstreamResponse::AntigravityGemini`]）。写成构造器而不是
+    /// 让各家手写字段，是为了「响应协议」这一个新字段不给各处调用点各留一次
+    /// 写错的机会。
+    pub fn chat(url: String, headers: Vec<(String, String)>, body: Value) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::Chat,
+        }
+    }
+
+    /// Command Code 形态：请求体是自有信封（`config` / `params` 那套），
+    /// 响应是 NDJSON（见 [`UpstreamResponse::CommandCodeNdjson`]）。
+    ///
+    /// 与 [`Self::chat`] 同一动机：调用点只回答「响应是哪套协议」，
+    /// 不自己拼 `ChatRequestPlan` 的字段。
+    pub fn commandcode_ndjson(
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Value,
+    ) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::CommandCodeNdjson,
+        }
+    }
+
+    /// Antigravity 形态：请求体是 Cloud Code Assist 的 v1internal 信封
+    /// （`{project, model, userAgent, requestId, request:{…}}`），响应是
+    /// **Gemini SSE**（`data: {"response":{…}}`，见
+    /// [`UpstreamResponse::AntigravityGemini`]）。
+    ///
+    /// 与另外两个构造器同一动机（调用点只回答「响应是哪套协议」），
+    /// 单独一个名字是因为它要连**请求信封**一起表达 —— 那种信封只有
+    /// `antigravity_outbound` 会造。
+    pub fn antigravity_gemini(
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Value,
+    ) -> Self {
+        Self {
+            url,
+            headers,
+            body,
+            response: UpstreamResponse::AntigravityGemini,
+        }
+    }
+}
+
+/// 上游响应的协议（**请求体与响应必须同源**：这套标记由适配器在构造请求时
+/// 一并给出，编排层只按它选翻译层，不做二次推断）。
+///
+/// ── 为什么需要它 ────────────────────────────────────────────
+/// 本项目的历史前提是「所有上游都说 Chat」（见 `protocol` 的模块头），于是
+/// 无状态转发路径的下行帧一律按 chat SSE 处理。ZCode 的活动套餐通道打破了这个
+/// 前提：它的推理端点是 Anthropic Messages（`stream:true` 时吐 Anthropic 事件
+/// 流）。与其为一家新写一条「适配器自己转发」的路（那会丢掉账号轮换、限额冷却、
+/// 退避重试、usage 与取消处理，见 `upstream::provider_loop` 的有状态路径说明），
+/// 不如把「响应要说另一种协议」做成计划里的一个字段 —— 编排层只多一次分支，
+/// 其余全都共用。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum UpstreamResponse {
+    /// OpenAI Chat SSE（默认）
+    #[default]
+    Chat,
+    /// Anthropic Messages SSE：下发前折回标准 chat SSE（见 `upstream::translate`）
+    Anthropic,
+    /// Command Code 的 **NDJSON**（`application/x-ndjson`）：一行一个 JSON 事件、
+    /// **HTTP 恒 200**、错误以流内 `{"type":"error"}` 表达，因此连接的成败与
+    /// 「这一轮生成成没成」是两件事。下发前折回标准 chat SSE
+    /// （见 `upstream::translate` 与 `protocol::commandcode_outbound`）——
+    /// 走翻译层的理由与 Anthropic 那条逐字相同：账号轮换、限额冷却、退避重试、
+    /// usage 记账与取消处理全部留在编排层，只有字节形态在翻译器里变。
+    CommandCodeNdjson,
+    /// Antigravity 的 **Gemini v1internal 信封 + SSE**：上游是 Google Cloud Code
+    /// Assist 的 `:streamGenerateContent?alt=sse`，每帧是 `data: {json}`，且真正的
+    /// Gemini 响应在 `response` 键下（缺省回退顶层，见规格 §4.2）。
+    /// 字段路径（`candidates[0].content.parts[*]`、`usageMetadata`、
+    /// `finishReason`、`thought` 位、`thoughtSignature`）全是 Gemini 方言，
+    /// 因此与 Anthropic / NDJSON 并列另开一台状态机（`upstream::translate` 的
+    /// `AntigravityToChatStream` ← `protocol::antigravity_stream`）。
+    /// 走翻译层的理由同上：账号轮换、限额冷却、退避重试、usage 记账与取消处理
+    /// 全部留在编排层，只有字节形态在翻译器里变。
+    AntigravityGemini,
 }
 
 /// 上游错误分类（架构文档 §4.2；三个动作的语义见模块头）。
@@ -167,7 +279,7 @@ pub enum UpstreamErrorClass {
     ///
     /// 它是「误报」信号而不是账号问题：账号余额健康、未限流、session 未死，
     /// 换账号再试只会白扔另一个账号的额度（同一份 body 换谁发都会被拦）。
-    /// 判定规则是五家共用的（见 `providers::content_block`），编排层的动作见
+    /// 判定规则是各家共用的（见 `providers::content_block`），编排层的动作见
     /// `upstream::provider_loop` 的「动作 0」。
     ContentBlocked {
         status: u16,
@@ -221,7 +333,7 @@ pub struct RetryAdvice {
 pub enum ReasoningPatch {
     /// 注入：把 body 顶层的 `field` 设成 `value`（覆盖同名的旧值）。
     ///
-    /// `Value` 而不是 `String`：当前两家（CatPaw / Qoder）要的都是字符串档位，
+    /// `Value` 而不是 `String`：当前覆写这个钩子的几家要的都是字符串档位，
     /// 但上游表达「开思考 + 档位」的形态未必都是字符串（布尔开关、嵌套对象
     /// 都常见），留成 `Value` 让将来那家不必先改这个枚举的**形状**。
     Set {
@@ -289,13 +401,13 @@ pub trait ProviderAdapter: Send + Sync {
     /// 哪些模型」，写错会把用户真能用的模型挡在门外。
     ///
     /// ── `store` 为什么是参数（而不是让实现自己造一个）──────────
-    /// 需要按账号状态收窄的实现（当前只有 Cline 按额度池）必须读**调用方手上
-    /// 那个 store 句柄**：`AccountStore` 是 `Clone` 但每个 `with_config_dir()`
+    /// 需要按账号状态收窄的实现必须读**调用方手上那个 store 句柄**：
+    /// `AccountStore` 是 `Clone` 但每个 `with_config_dir()`
     /// 各自持一把锁，自己再造一个就成了「绕过主句柄的第二把锁」——
     /// 读到的可能不是最新状态，而且它保护的读-改-写周期与主句柄互不可见。
     /// 由调用方传入既省一次文件读，也让「读的是同一份账号状态」这件事成立。
     ///
-    /// 默认恒等（另外五家没有「同一个模型的两个通道」这种结构），
+    /// 默认恒等（现在各家都没有「同一个模型的两个通道」这种结构），
     /// 因此默认实现忽略 `store`。
     fn advertise_models(&self, _store: &AccountStore, manifest: Vec<Value>) -> Vec<Value> {
         manifest
@@ -350,9 +462,10 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// ── 为什么默认是「不接」而不是「透传一个通用字段」────────────
     /// 默认实现返回 `Skip`，且**所有没覆写的家都应当保持它**。理由是本项目的
-    /// 一条既有事实：五家里有三家（workbuddy / 小浣熊 / Cline）的
-    /// `build_chat_request` 是 `body.clone()` 原样透传，另外两家的上游协议由
-    /// 各自的 resolver 现算档位 —— **没有任何证据**表明它们认识一个通用档位
+    /// 一条既有事实：多数家（workbuddy / 小浣熊 / Cline 等）的
+    /// `build_chat_request` 是 `body.clone()` 原样透传，需要翻译档位的家
+    /// 各有各的现算路径（见各适配器对 [`Self::reasoning_patch`] 的覆写）——
+    /// **没有任何证据**表明它们认识一个通用档位
     /// 字段。给上游塞一个它不认识的键不叫「让绑定生效」，只是把未知参数推过去：
     /// 好一点的情况是被忽略（用户以为生效了，其实没有），坏一点是 400。
     /// 所以接一家要有一家的证据（上游枚举、实测、上游自己的 resolver 认这个键），
@@ -372,7 +485,7 @@ pub trait ProviderAdapter: Send + Sync {
     /// 编排层在按家改写模型名时才解析出来（同一处，见 `catalog::WireTarget`）；
     /// 把它塞进 `build_chat_request` 会让适配器看到一份与它无关的编排层状态，
     /// 也会让 `forward_conversation` 那条有状态路径（CatPaw / Qoder 都走它）
-    /// 拿不到这个值 —— 而这两家恰恰是唯一要翻译的两家。
+    /// 拿不到这个值 —— 而这两家恰恰也需要翻译档位。
     ///
     /// `model` 是**即将发给上游的那个名字**（已按家改写，见 `WireTarget.model`）：
     /// 需要按模型判断档位的家（Qoder 要拿它去查模型的 `efforts`）用它，
@@ -413,6 +526,14 @@ pub trait ProviderAdapter: Send + Sync {
             .filter(|level| !crate::server::core::model_rules::reasoning_is_off(level))
     }
 
+    /// 响应头是否表明上游错误；默认沿用 HTTP 非 2xx 的判定。
+    ///
+    /// 部分流式上游用 HTTP 200 + application/json 返回业务错误，适配器可
+    /// 在成功流交给客户端之前将它送入既有错误读取、分类与账号轮换流程。
+    fn is_error_response(&self, status: u16, _headers: &HeaderMap) -> bool {
+        !(200..300).contains(&status)
+    }
+
     /// 判定上游错误类型（status + 已解析的错误体）。
     ///
     /// `error_body` 是**已归一化**的错误对象：至少含 `code`（上游业务码，
@@ -421,6 +542,46 @@ pub trait ProviderAdapter: Send + Sync {
     /// `upstream::request::read_upstream_error`），因为「怎么读一个 HTTP 错误体」
     /// 是协议层的事、与哪一家无关。
     fn classify_error(&self, status: u16, error_body: &Value) -> UpstreamErrorClass;
+
+    /// 会话式转发（`attempt_stateful`）失败后的分类。
+    ///
+    /// ── 为什么这个钩子必须存在 ─────────────────────────────────
+    /// 会话式路径的错误编排历来是「一律透传（Fatal 语义）：不换账号、不冷却、
+    /// 不重试」（见 `provider_loop::attempt_stateful`）。但「透传」只该是
+    /// **编排**的默认，不该堵死分类：CodeArts 因会话准入走有状态路径，它的
+    /// 流内额度信封（HTTP 200 SSE → 首包门 403）在这条路径上永远到不了
+    /// [`Self::classify_error`]，结果福利池耗尽后每个请求都从头撞一遍全部
+    /// 账号、一个冷却标记都不落。分类本身是 provider 专属知识（403 是额度
+    /// 还是封禁，只有适配器知道），所以由适配器供给。
+    ///
+    /// ── 为什么默认是 Fatal ─────────────────────────────────────
+    /// 既有会话式家（CatPaw）的行为就是透传，默认值让它们逐字不变；
+    /// 只有明确声明「我的会话式错误里有可记账的限额」的家才覆写。
+    /// 注意编排层只取这里 QuotaLimited 的**记账**语义（标记冷却后仍按队列
+    /// 顺延）—— 不会对同一条错误再套用无状态路径的重试/刷新动作。
+    fn classify_conversation_error(&self, error: &GatewayError) -> UpstreamErrorClass {
+        UpstreamErrorClass::Fatal {
+            status: u16::try_from(error.status_code).unwrap_or(500),
+            message: error.message.clone(),
+            upstream_code: error.upstream_code,
+        }
+    }
+
+    /// 一次限额要给哪些**模型冷却键**记账。
+    ///
+    /// 默认只有本次的上游真名一条。 CodeArts 的福利池是**账号级**日额度：
+    /// 池子耗尽时该账号的全部福利模型（下一轮哪怕请求的是另一个名字）都会
+    /// 撞同样的 `insufficient quota`，只记一个键挡不住下一次顺延白撞 ——
+    /// 所以这类家返回整组真名。返回值必须是**上游真名**（与
+    /// `routing::CooldownKeys` 写读两侧同一口径），传入的 `wire_model` 就是
+    /// 本次发出去的真名。
+    ///
+    /// `account_id` 供按账号取目录的家使用（当前 CodeArts 的目录是全 provider
+    /// 共享缓存，不用它；留在签名里避免下一个这类家改签名）。
+    fn quota_cooldown_models(&self, _account_id: &str, wire_model: &str) -> Vec<String> {
+        vec![wire_model.to_string()]
+    }
+
     /// 取可用 access token（含临期主动刷新；刷新结果回写 store）。
     ///
     /// `account_id` 为空串表示「没有指定账号」：用默认登录态
@@ -482,7 +643,7 @@ pub trait ProviderAdapter: Send + Sync {
         true
     }
 
-    /// 本 provider 是否有**已接入的推理转发能力**（五家现在都是 true）。
+    /// 本 provider 是否有**已接入的推理转发能力**（各家现在都是 true）。
     ///
     /// ── 这条声明曾经区分过什么（历史，别误会成现在还有 false）─────
     /// Qoder 在接入推理协议之前返回 false（它当时只有账号管理能力），
@@ -508,7 +669,8 @@ pub trait ProviderAdapter: Send + Sync {
     /// 本 provider 是否有**可拉取的远程模型目录**（模块头扩展 9）。
     ///
     /// 判据与 `supports_refresh` 同一口径：**上游到底有没有那个接口**，
-    /// 不是「我们想不想实现」。当前五家**全部覆写成 true**：
+    /// 不是「我们想不想实现」。当前各家**全部覆写成 true**（下表是早期五家，
+    /// 后来接入的家见各自 `models.rs` 的模块头）：
     /// ```text
     ///   WorkBuddy   GET  /v3/config
     ///   小浣熊       GET  {llmBase}/model_catalog
@@ -559,6 +721,31 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// 哪些 `finish_reason` 表示**上游拒答**（HTTP 200 的假成功），默认空 = 不认。
+    ///
+    /// ── 为什么需要它（本家独有的上游形态）────────────────────────
+    /// 有些上游（实测 OfficeAce / 华为 AgentArts 网关）把内容审核拒绝包装成一次
+    /// 正常答复：`HTTP 200`、SSE 干净收尾，但正文是一句固定拒绝话术，终帧
+    /// `choices[].finish_reason = content_filter`。只看 HTTP 状态这就是**假成功**
+    /// —— 编排层不换家，客户端把套话当答案（真实现象：ZCode 的 agentic 请求打到
+    /// 本家条条如此，见 `upstream::refusal` 模块头）。
+    ///
+    /// 判定由编排层执行：一旦置了本家的 `UpstreamResponse`/流式门控，就会把
+    /// 该 `finish_reason` 视为一次**可轮换失败** —— 队列里还有别的账号/家就换，
+    /// 只剩这一家时给客户端一句**可读错误**（而不是那句上游套话）。
+    ///
+    /// ── 为什么默认空、以及代价 ──────────────────────────────────
+    /// 默认空 = **不认任何 `finish_reason`**，别家逐字节不变。声明是加法的：
+    /// 一旦声明，本家所有流式请求会先在**有界**的头部缓冲里拉一小段以判定
+    /// （见 `upstream::refusal`，上限 32 KiB）—— 真答案因此被推迟最多一节首字节。
+    /// 这个代价只在声明的家上发生，且拒绝话术远在缓冲上限之内 ⇒ 对拒绝必中。
+    ///
+    /// ⚠️ 别把这里的值写成「上游偶发会回的任意值」：`length`（预算截断）是**正常**
+    /// 收尾，不该换家；只有「上游明确不给你这次答复」的取值才属于本表。
+    fn stream_refusal_finishes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// 本 provider 是否支持**主动**刷新凭证（模块头扩展 5）。
     ///
     /// 默认 false = 这家没有续期手段（没有 refreshToken、上游也没有刷新接口）。
@@ -600,6 +787,26 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// 账号未显式配代理时，本家的出网是否**跟随系统代理**（默认 false = 直连）。
+    ///
+    /// ── 默认口径为什么是直连 ────────────────────────────────────
+    /// 转发出口由账号的代理配置决定，不被机器上的 `HTTPS_PROXY` / 系统代理
+    /// 悄悄改写（见 `egress::build_client` 的说明）—— 否则界面上显示「直连」
+    /// 的账号实际走了代理，与用户看到的不符。
+    ///
+    /// ── 谁会覆写成 true ─────────────────────────────────────────
+    /// 上游在多数网络里**只有经代理才可达**的家：Antigravity（Google）。
+    /// 用户机器上「已经能打开 Google 的那个代理」就写在系统设置里（浏览器能
+    /// 打开授权页正是靠它），账号若没单独配代理，跟随它是唯一合理的默认 ——
+    /// 系统没配代理时它等价于直连，不引入新的失败面。覆写方要在自己的模块头
+    /// 说明这条口径的适用范围（别让别的家照抄）。
+    ///
+    /// 只影响**转发链路**的客户端选择；登录链路没有账号可挂，本来就走
+    /// `egress::client_for_system_proxy()`（见 `upstream::request` 的三选一）。
+    fn system_proxy_when_unset(&self) -> bool {
+        false
+    }
+
     /// 本 provider 的**环境变量凭证现在是否真的存在**（模块头扩展 3 的配套）。
     ///
     /// 与 `allows_anonymous_default_session` 的分工：那个回答「这家支持这条旁路
@@ -632,6 +839,18 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// SSE 下发帧要不要丢掉「整片只有换行」的 content 分片（模块头扩展 11）。
+    ///
+    /// 默认 false（帧的字节逐字不变）。目前声明 true 的只有 WorkBuddy 与
+    /// AutoClaw —— 那两家的上游会在正文分片之间插纯换行的帧作为
+    /// 保活节拍，客户端按 markdown 渲染就被排成一行一个词。
+    /// 判据与实测口径见 [`crate::server::core::upstream::sse::is_newline_keepalive`]；
+    /// **执行不在这里**：本方法只回答「要不要」，丢帧动作落在 `upstream::sse`
+    /// 这个 SSE 逐行解析的唯一出口，与 [`Self::sse_model_rewrite`] 同一分工。
+    fn sse_strip_newline_chunks(&self) -> bool {
+        false
+    }
+
     /// 本 provider 的上游是否为**有状态（conversation 协议）**（模块头扩展 6，
     /// 架构文档 §4.2.1）。
     ///
@@ -641,14 +860,16 @@ pub trait ProviderAdapter: Send + Sync {
     /// **会话式转发入口** [`Self::forward_conversation`]；产出与无状态路径同一种
     /// `ForwardOutcome`，于是 `chat.rs` 的其余链路（脱敏、记账、错误写出）零改动。
     ///
-    /// 唯一的 true 是 `catpaw::CatPawAdapter`（W5-T-d4 接线后）。
+    /// 覆写成 true 的是走会话式转发入口的家（CatPaw / Qoder / Accio /
+    /// CodeArts / Trae / Kuku / MonkeyCode，见各自 `mod.rs` 的模块头）。
     fn is_stateful(&self) -> bool {
         false
     }
 
     /// **会话式转发入口**（模块头扩展 6 的配套；架构文档 §4.2.1）。
     ///
-    /// 只有有状态 provider 覆写它（当前是 CatPaw）。默认实现返回 503：走到这里
+    /// 只有有状态 provider 覆写它（`is_stateful` 为 true 的家，见各自 `mod.rs`）。
+    /// 默认实现返回 503：走到这里
     /// 说明编排层把一家无状态 provider 当成了有状态的 —— 那是**内部契约错误**，
     /// 报错比让 `build_chat_request` 与 `forward_conversation` 各发一半安全。
     ///
@@ -755,7 +976,7 @@ pub trait ProviderAdapter: Send + Sync {
 
     /// 本 provider 是否支持**余额 / 积分查询**（模块头扩展 8）。
     ///
-    /// 默认 false。四家里四家都支持，但语义各不相同：
+    /// 默认 false。支持的家各有各的语义，下面举四家为例：
     ///   - workbuddy：腾讯计费接口的「积分简报」（`core::billing`，改造前唯一有的一家）；
     ///   - 小浣熊：官方积分钱包 + 订阅权益（`raccoon/balance.rs`）；
     ///   - CatPaw：美团 credit 域的额度接口，**需要额外配置网页会话凭证 token2**
@@ -792,6 +1013,11 @@ pub trait ProviderAdapter: Send + Sync {
     ///   "raw": { }                    // 各家原始响应（排障用；前端默认不展示）
     /// }
     /// ```
+    /// 上面那套之外还有几个**可选展示键**，各家按自己的读数形态自带、前端按形状探测
+    /// （不按 provider 判）：`availableView`（读数的紧凑展示串）、`balanceView`
+    /// （明细行自己的展示串，含重置时刻那类补充）、`credits[]`（逐份积分读数）、
+    /// `windows[]`（逐窗口读数，如 OpenCode 的 5 小时 / 每周 / 每月三个窗口，
+    /// 界面一格画三条）。不带这些键的家走的仍是最上面那套基础形状。
     ///
     /// ── 契约（调用方按这几条写）────────────────────────────────
     ///   1. **不抛 HTTP 错误的语义**：实现返回 `Err` 表示「这次查询失败」，
@@ -836,11 +1062,12 @@ pub const USAGE_NOT_CONFIGURED_CODE: &str = "usage_not_configured";
 /// 「该账号没有配置余额查询凭证」的统一文案（`GatewayError::code` 同为
 /// [`USAGE_NOT_CONFIGURED_CODE`]）。
 ///
-/// ── 为什么这条要四家共用一份，而不是各家自己拼 ─────────────────
+/// ── 为什么这条要各家共用一份，而不是各家自己拼 ─────────────────
 /// 前端按 `code`（不是文案）判定「这是未配置、不是失败」，但**文案仍会显示
-/// 在面板上**；各家各写一句会让同一个「去设置里补一下凭证」的动作在四家账号上
-/// 呈现四种措辞。CatPaw 是当前唯一会真正走到这里的一家（它的余额接口要的是
-/// 网页会话凭证 `token2`，与转发用的 `X-Passport-Token` 不是同一个东西）。
+/// 在面板上**；各家各写一句会让同一个「去设置里补一下凭证」的动作在不同家
+/// 的账号上呈现不同措辞。会真正走到这里的是「余额接口另需一份查询凭证」的家
+/// （如 CatPaw 的网页会话凭证 `token2`、ZCode 的 Coding Plan JWT —— 见各自
+/// 的 `balance.rs`）。
 ///
 /// `field_hint` 说明去哪儿补（「账号设置里的余额查询凭证」），拼进 message；
 /// 状态码用 **400**：这是前置条件缺失、用户自己能修，不是服务端故障 ——
@@ -858,7 +1085,7 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 
 /// 注册表：provider → 适配器实现。
 ///
-/// **四家都已实现**：各自返回自己的静态实例。这个 match 是穷举的：加新 kind 时
+/// **各家都已实现**：各自返回自己的静态实例。这个 match 是穷举的：加新 kind 时
 /// 编译器会强制在这里给出一个分支，于是「注册了 provider 却忘了接线」这种事在
 /// 编译期就被拦住。
 ///
@@ -869,6 +1096,9 @@ pub fn usage_not_configured(provider_label: &str, field_hint: &str) -> GatewayEr
 pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
     match kind {
         ProviderKind::WorkBuddy => &super::workbuddy::WORKBUDDY_ADAPTER,
+        // WorkBuddy 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `workbuddy::region` 与 `workbuddy::adapter` 的模块头）
+        ProviderKind::WorkBuddyIntl => &super::workbuddy::WORKBUDDY_INTL_ADAPTER,
         ProviderKind::Raccoon => &super::raccoon::RACCOON_ADAPTER,
         ProviderKind::CatPaw => &super::catpaw::adapter::CATPAW_ADAPTER,
         ProviderKind::AutoClaw => &super::autoclaw::AUTOCLAW_ADAPTER,
@@ -876,6 +1106,10 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 参数化，见 `autoclaw::adapter` 与 `autoclaw::region` 的模块头）
         ProviderKind::AutoClawIntl => &super::autoclaw::AUTOCLAW_INTL_ADAPTER,
         ProviderKind::Qoder => &super::qoder::QODER_ADAPTER,
+        // Qoder 的两个地区是两个 provider、两个实例（同一份实现的按地区
+        // 参数化，见 `qoder::endpoints::Region` 与 `qoder::mod` 的模块头）
+        ProviderKind::QoderIntl => &super::qoder::QODER_INTL_ADAPTER,
+        ProviderKind::CodeArts => &super::codearts::CODEARTS_ADAPTER,
         // Cline 的两个额度池是两个 provider、两个实例（同一份实现的按池
         // 参数化，见 `cline::adapter` 的模块头）
         ProviderKind::ClineFree => &super::cline::CLINE_FREE_ADAPTER,
@@ -888,6 +1122,36 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
         // 见 `zcode::adapter` 与 `zcode::region` 的模块头）
         ProviderKind::Zcode => &super::zcode::adapter::ZCODE_ADAPTER,
         ProviderKind::ZcodeIntl => &super::zcode::adapter::ZCODE_INTL_ADAPTER,
+        ProviderKind::Trae => &super::trae::adapter::TRAE_ADAPTER,
+        // Loomy（讯飞）：无状态 OpenAI 兼容转发（token + Bearer 双头鉴权），
+        // 账号管理走手机号验证码登录（见 `loomy/mod.rs` 的模块头）
+        ProviderKind::Loomy => &super::loomy::LOOMY_ADAPTER,
+        // KukuAI（百度文库库库 AI）：有状态转发（请求内三步时序：建会话 →
+        // 分配算力 → SSE），账号管理走粘贴 Cookie / 导入本机登录态
+        // （见 `kuku/mod.rs` 的模块头）
+        ProviderKind::Kuku => &super::kuku::KUKU_ADAPTER,
+        // MonkeyCode（长亭科技）：账号管理（粘贴 session）+ 模型目录 + 会话转发
+        // 全部已接通（建任务 → WebSocket 任务流 → ACP 事件翻译，`is_stateful`
+        // 为 true，见 `monkeycode/mod.rs` 与 `monkeycode/adapter.rs` 的模块头）。
+        // 两个站点是两个 provider、两个实例（同一份实现按地区参数化）
+        ProviderKind::MonkeyCode => &super::monkeycode::MONKEYCODE_ADAPTER,
+        ProviderKind::MonkeyCodeIntl => &super::monkeycode::MONKEYCODE_INTL_ADAPTER,
+        // Command Code（`api.commandcode.ai`）：无状态（一次 HTTP 请求 = 一次
+        // 生成）、粘贴 `user_` API Key、响应是 NDJSON（`UpstreamResponse::
+        // CommandCodeNdjson`，见 `commandcode/mod.rs` 的模块头）
+        ProviderKind::CommandCode => &super::commandcode::COMMANDCODE_ADAPTER,
+        // Antigravity（Google 的 AI IDE）：账号 / token 刷新 / 模型目录 / 会话转发
+        // 全部已接通（转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层，
+        // 见 `antigravity/mod.rs` 与 `antigravity/adapter.rs`）
+        ProviderKind::Antigravity => &super::antigravity::ANTIGRAVITY_ADAPTER,
+        // OfficeAce（华为云果办 / OfficeClaw）：无状态 OpenAI 兼容转发
+        // （Basic 网关凭据；账号管理走手工导入 / 自助 OAuth，见
+        // `officeace/mod.rs` 的模块头）
+        ProviderKind::OfficeAce => &super::officeace::adapter::OFFICEACE_ADAPTER,
+        // OrcaTerm（腾讯云遨驰终端桌面客户端）：账号 / OAuth 续期 / 会话转发 /
+        // 余额全部已接通（建会话 → assistant SSE，`is_stateful` 为 true，
+        // 见 `orcaterm/mod.rs` 与 `orcaterm/adapter.rs` 的模块头）
+        ProviderKind::OrcaTerm => &super::orcaterm::ORCATERM_ADAPTER,
     }
 }
 
@@ -898,8 +1162,8 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 /// 注册表项都在、但适配器是占位」的中间态，那时它**不在本列表里**；
 /// W4b-T-c2 接上真身（`autoclaw::adapter::AUTOCLAW_ADAPTER`）后列入本表 ——
 /// 与 CatPaw 在 W5-T-d4 走过的路径相同。Qoder 也走过同一条路：接入推理转发
-/// 之前它只有账号管理能力，本波次接上真身后列入。**现在八家全部在列表里**
-/// （AutoClaw 的两个地区算两家），与 `PROVIDERS` 的 id 集合一一对应
+/// 之前它只有账号管理能力，本波次接上真身后列入。**现在注册表里的各家全部在
+/// 列表里**，与 `PROVIDERS` 的 id 集合一一对应
 /// （过渡期的占位实现已在 W6 随 `pending.rs` 删除）。
 ///
 /// Cline 算两家（`ClineFree` / `ClinePass`）：它们是两个 provider、两份清单，
@@ -924,11 +1188,20 @@ pub fn adapter_for(kind: ProviderKind) -> &'static dyn ProviderAdapter {
 pub fn implemented_kinds() -> Vec<ProviderKind> {
     vec![
         ProviderKind::WorkBuddy,
+        // WorkBuddy 国际版算一家：与国内版各自一份模型清单（`/v3/config` 打
+        // 各自的站点）、各自的缓存槽与刷新排期 —— 两家都必须在本列表里，
+        // 否则国际版的目录刷新永远不会被调度（症状是「国际版账号加了、
+        // 模型列表一直是内置兜底」）。
+        ProviderKind::WorkBuddyIntl,
         ProviderKind::Raccoon,
         ProviderKind::CatPaw,
         ProviderKind::AutoClaw,
         ProviderKind::AutoClawIntl,
         ProviderKind::Qoder,
+        // Qoder 国际版算一家：与国内版各自一份模型清单、各自的缓存槽与刷新
+        // 排期（拆家后的既定口径，与 WorkBuddy 两个地区同一理由）—— 不在的
+        // 话国际版的目录刷新永远不会被调度。
+        ProviderKind::QoderIntl,
         ProviderKind::ClineFree,
         ProviderKind::ClinePass,
         // Accio 的两个地区各算一家（同一份实现、两套账号与目录缓存）
@@ -941,6 +1214,43 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
         // 本列表回答的是「这家接线了没有」，不是「这家的目录能不能远程刷」。
         ProviderKind::Zcode,
         ProviderKind::ZcodeIntl,
+        // CodeArts 在本列表里 = 适配器已接线（登录 / 凭据 / 目录 / 转发 / 余额
+        // / 每日福利）、可参与目录刷新调度。
+        ProviderKind::CodeArts,
+        // Trae 已接真身（登录 / 凭据 / 目录 / 转发），并且**真有**远程目录
+        // （`supports_model_refresh()` 为 true），所以它必须在本列表里 ——
+        // 不在的话刷新循环根本不会问它，症状是"界面上点了刷新、日志里
+        // 一句 trae 都没有"（与"刷了但没取到"是两种完全不同的故障）。
+        ProviderKind::Trae,
+        // Loomy 已接真身（登录 / 凭据 / 目录 / 转发 / 余额 / 每日积分刷新），
+        // 且有远程目录（`GET {网关}/api/v1/models`）—— 必须在列表里，
+        // 否则目录刷新循环不会问它。
+        ProviderKind::Loomy,
+        // KukuAI 已接真身（凭据 / 目录 / 转发 / 余额），且有远程目录
+        // （`/wenchain/genflowpro/model_list`）—— 必须在列表里，否则刷新循环
+        // 不会问它（与 Trae 同一理由）。
+        ProviderKind::Kuku,
+        // MonkeyCode 的两个站点各算一家：适配器已接线（账号 / 目录 / 会话转发
+        // 全部已通），且有远程目录（`GET /api/v1/users/models`）—— 必须在
+        // 列表里，否则目录刷新循环不会问它。
+        ProviderKind::MonkeyCode,
+        ProviderKind::MonkeyCodeIntl,
+        // Command Code 已接真身（账号 / 目录 / 转发），且有远程目录
+        // （`GET /provider/v1/models`，失败回落内置 26 项清单）—— 必须在列表里，
+        // 否则目录刷新循环不会问它。
+        ProviderKind::CommandCode,
+        // Antigravity 已接真身（账号 / token 刷新 / 目录 / 转发），且有远程目录
+        // （`POST {base}:fetchAvailableModels`）—— 必须在列表里，否则目录刷新
+        // 循环不会问它。转发走 `UpstreamResponse::AntigravityGemini` 那条翻译层
+        // （Gemini v1internal 信封 + SSE），`build_chat_request` 已接真身。
+        ProviderKind::Antigravity,
+        // OfficeAce：远程目录（`GET {网关}/v1/models`）+ 有转发能力，
+        // 进本列表才会被后台目录刷新调度
+        ProviderKind::OfficeAce,
+        // OrcaTerm：适配器已接线（账号 / 续期 / 转发 / 余额），但**没有**
+        // 远程模型目录（静态清单，`supports_model_refresh()` 为 false）——
+        // 进本列表只代表「已实现」（与 Zcode 同一口径：刷新循环对它是空操作）。
+        ProviderKind::OrcaTerm,
     ]
 }
 
@@ -948,8 +1258,8 @@ pub fn implemented_kinds() -> Vec<ProviderKind> {
 ///
 /// ── 为什么不用 `core::models::RefreshOutcome` ────────────────────
 /// 那个类型是 **workbuddy 单家**的既有契约（`{refreshed, count, source, reason}`，
-/// 与 Node 版逐字对应），拴在 `ModelCatalog` 上。适配器层还要表达另外三家的事实
-/// （小浣熊的「TTL 跳过」、静态表的「没有远程目录」），拿它覆盖四家会逼着三家填
+/// 与 Node 版逐字对应），拴在 `ModelCatalog` 上。适配器层还要表达另外几家的不同事实
+/// （小浣熊的「TTL 跳过」、没有远程目录的家的「跳过」等），拿它覆盖各家会逼着这些家填
 /// 无意义的 `source`/`reason`，还要动 `core::models` 的既有类型。本类型是**最小
 /// 适配器层形态**：workbuddy 在实现里把自己的 `RefreshOutcome` 搬运过来即可。
 ///
@@ -1013,23 +1323,33 @@ fn seed_current_raccoon_defaults() {
 /// 与 `seed_current_raccoon_defaults` 同理：刷新可能因失败 / 无登录态而不落地
 /// 新清单 —— 那条路径上没有种子可挂，启动后手里的这份清单（内置或旧缓存）
 /// 也要有同样的默认值。幂等：种过的 id 不会再动。
+///
+/// **两个地区各跑一遍**（拆家后各有各的清单与 provider 键）：种子按
+/// `(provider, id)` 记账，只种国内版会让国际版的新模型停在全开状态，
+/// 而两家的模型名很可能同名。
 fn seed_current_workbuddy_defaults() {
-    let ids: Vec<String> = crate::server::core::models::global_catalog()
-        .list()
-        .iter()
-        .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(&ids) {
-        crate::server::logging::log("[Models]", &summary);
+    for region in super::workbuddy::Region::ALL {
+        let ids: Vec<String> = crate::server::core::models::global_catalog(region)
+            .list()
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        if let Some(summary) = crate::server::core::model_rules::seed_workbuddy_defaults(
+            region.provider_id(),
+            &ids,
+        ) {
+            crate::server::logging::log("[Models]", &summary);
+        }
     }
 }
 
 /// 对**当前缓存清单**里的 Qoder 模型补一次默认规则种子（默认只启用白名单内的
 /// 模型，见 `model_rules::seed_qoder_defaults`）。
 ///
-/// 委托给 `qoder::models::seed_default_rules` —— 那边取的是两个地区的**并集**，
-/// 与刷新落地时种的是同一份口径。要这一手补种的理由与 WorkBuddy 相同：Qoder
-/// 在没有账号 / 远程刷新失败时手里只剩静态兜底清单，而**升级用户**的并集正是
+/// 委托给 `qoder::models::seed_default_rules` —— 那边按地区各取各的清单、各按
+/// 各的 provider id 种（拆家后两家是两套 `(provider, id)` 命名空间），与刷新
+/// 落地时种的是同一份口径。要这一手补种的理由与 WorkBuddy 相同：Qoder 在
+/// 没有账号 / 远程刷新失败时手里只剩静态兜底清单，而**升级用户**的清单正是
 /// 那份兜底 —— 不补种的话，他们打开管理页看到的仍是旧的全开状态。
 fn seed_current_qoder_defaults() {
     qoder::models::seed_default_rules();
@@ -1061,31 +1381,29 @@ fn seed_current_cline_defaults() {
     }
 }
 
-/// 让所有**已实现**的 provider 各刷新一次模型目录（后台任务入口）。
+/// 让所有**已实现**的 provider 各刷新一次模型目录（**自动**路径入口）。
 ///
-/// 调用点：`api::chat::spawn_catalog_refresh`（GET /v1/models 的异步刷新）
-/// 与 `ServerState::bootstrap`（启动刷新）。逐个 await（而不是并发）：
-/// provider 数量是个位数、刷新是低频后台动作，串行更好排查（日志顺序稳定）。
-/// 失败不会中断循环 —— 各适配器的 `refresh_models` 已把失败收敛成
-/// 「保留现有清单 + 打日志」。
+/// 调用点：`api::chat::spawn_catalog_refresh`（客户端拉 `/v1/models` 的后台刷新）
+/// 与「模型目录刷新」定时任务。真正的循环在 `providers::catalog_refresh` ——
+/// 与手动路径共用同一段实现，两条入口只在 `manual` 这一个开关上分叉。
 ///
-/// **传 `force = false`**：这是**自动**路径，各家照用自己的缓存/TTL（小浣熊的
-/// 10 分钟 TTL 就是为它设的）。手动按钮走 [`refresh_implemented_forced`]。
-pub async fn refresh_implemented(store: &AccountStore) {
+/// **自动路径受排期与冷却约束**：每家的刷新间隔、在途占位、失败冷却都由
+/// `core::task_state` 持久化（`modelRefresh:<provider>`），因此「重启一次就重刷
+/// 一遍」「客户端每次拉列表都真打一次上游」都不会再发生。这也是它返回逐家结果
+/// 的原因：定时任务要按状态统计（成功 / 跳过 / 失败）并写进任务摘要。
+///
+/// 各家自身的缓存/TTL 仍然生效（`force = false`）：排期说「可以刷了」之后，
+/// 由各家决定这次是否真的打网络。手动按钮走 [`refresh_implemented_forced`]。
+pub async fn refresh_implemented(store: &AccountStore) -> Vec<Value> {
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
-    for kind in implemented_kinds() {
-        let adapter = adapter_for(kind);
-        // 注册表与适配器自报的 kind 必须一致（不一致说明 `adapter_for`
-        // 的 match 分支接错了）；只在 debug 断言，release 不 panic（panic=abort）
-        debug_assert_eq!(adapter.kind(), kind);
-        // 自动路径不看结果：各适配器内部已经把「成功 / 没刷 / 失败」都打进了日志
-        // （`refresh_models` 的契约就是失败不返回错误），这里再处理一遍只会重复。
-        // 账号传空串 = 各家按默认选取（队首可用账号），自动路径没有「点名」的概念
-        adapter.refresh_models(store, "", false).await;
-    }
+    let results = super::catalog_refresh::refresh(store, &serde_json::Map::new(), None, false).await;
+    // 刷新落地后补种一次：新增的带前缀 / 别名模型在这一刻才出现在清单里
+    // （与开头那次同一件事 —— 那时种的是缓存恢复的清单）
+    seed_current_cline_defaults();
+    results
 }
 
 /// 启动时恢复各家的持久化清单缓存（`ServerState::bootstrap` 在库句柄就绪后
@@ -1155,10 +1473,14 @@ pub fn restore_cached_catalogs() {
 ///   1. **`force = true`**：用户按下按钮的全部预期是「现在真的去拉一次」。
 ///      小浣熊的 TTL 早退会让「点了没反应、清单没变」，与功能坏掉无法区分。
 ///      缓存只该为后台自动路径服务，用户显式要求时一律绕过。
+///      同理，**普通排期也一并跳过**（`manual` 开关，见 `catalog_refresh`）——
+///      手动刷新可以提前，但仍受在途占位与失败冷却约束（那两条是上游限流，
+///      不该由界面按钮解除）。
 ///   2. **只刷支持的家**：静态清单的家不去打那次必然白跑的网络请求。
 ///   3. **返回逐家结果**：自动路径失败只写日志（没有人在等它）；手动路径必须
 ///      把「哪家刷到了几个、哪家为什么没刷」交给界面 —— 一句笼统的「已刷新」
 ///      会让「其实失败了」和「其实跳过了」都显示成成功。
+///      （自动路径现在同样返回逐家结果：定时任务要按它统计本轮摘要。）
 ///
 /// ── `skipped` 与 `failed` 的区别（界面的文案完全依赖这个区分）──
 ///   - `skipped`：**这次没有可刷的东西，且不是错误**。两种来源：这家没有
@@ -1188,82 +1510,12 @@ pub async fn refresh_implemented_forced(
     accounts: &serde_json::Map<String, Value>,
     providers: Option<&[String]>,
 ) -> Vec<Value> {
-    let mut results: Vec<Value> = Vec::new();
-    // 手动刷新前对缓存清单补一次种子（刷新成功落地新清单后 raccoon / workbuddy
-    // 内部还会再种一次）
     seed_current_raccoon_defaults();
     seed_current_workbuddy_defaults();
     seed_current_qoder_defaults();
     seed_current_cline_defaults();
-    for kind in implemented_kinds() {
-        let adapter = adapter_for(kind);
-        debug_assert_eq!(adapter.kind(), kind);
-        let provider_id = kind_id(kind);
-        // 范围白名单（见上方说明）：名单外直接跳过，不打网络也不进结果
-        if let Some(allowed) = providers {
-            if !allowed.iter().any(|id| id == provider_id) {
-                continue;
-            }
-        }
-        let provider_label = meta(kind).label;
-        // 这家在弹窗里点名的账号（空串 = 默认选取）
-        let requested = accounts
-            .get(provider_id)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .unwrap_or("");
-        if !adapter.supports_model_refresh() {
-            // 不支持的家**不进网络**：静态清单刷十次还是同一份，打上游只是白跑。
-            // `fixed: true` 是给前端的机器可识别标记（理由见上方「结果字段」）。
-            // **当前五家都支持远程目录，本分支在生产路径上走不到** ——
-            // 保留它是给将来新接入的 provider 用的（与 trait 的默认 false 配对）
-            results.push(json!({
-                "provider": provider_id,
-                "providerLabel": provider_label,
-                "status": "skipped",
-                "fixed": true,
-                "message": "该提供商使用固定模型清单（上游没有远程目录接口）",
-                // 与其它分支同一契约：这家没有远程目录，时刻恒为 0（界面显示占位）
-                "refreshedAt": 0,
-            }));
-            continue;
-        }
-        let outcome = adapter.refresh_models(store, requested, true).await;
-        // 本次实际使用的账号：不走账号维度的家（Cline）不带这个键；点名了就用
-        // 点名的那条；没点名按同一套判据解析队首（与各家实现的默认选取一致）。
-        // 没有账号的家（如从未添加过账号）解析为 None，也不带这个键。
-        let used = if !adapter.refresh_uses_account() {
-            None
-        } else if requested.is_empty() {
-            store.current_entry_for_provider(provider_id).map(|entry| entry.id)
-        } else {
-            Some(requested.to_string())
-        };
-        let mut item = json!({
-            "provider": provider_id,
-            "providerLabel": provider_label,
-        });
-        if let Some(account_id) = used {
-            item["accountId"] = json!(account_id);
-        }
-        if outcome.refreshed {
-            item["status"] = json!("refreshed");
-            item["count"] = json!(outcome.count);
-        } else if let Some(message) = outcome.message {
-            item["status"] = json!("failed");
-            item["message"] = json!(message);
-        } else {
-            item["status"] = json!("skipped");
-            item["message"] = json!("本次刷新没有取到新清单（上游未返回可用的模型列表）");
-        }
-        // 这家清单**当前**的拉取时刻（毫秒；0 = 从未成功过），界面的「更新日期」
-        // 列读它。必须在 `refresh_models` **之后**取：本次成功的家拿到的是刚刚
-        // 那一刻，失败 / 跳过的家拿到的是上次成功那次的时刻 —— 那正是「这份清单
-        // 是什么时候的」这个问题要的答案（用「本次请求的时刻」会在失败行上撒谎，
-        // 显示成刚更新过）。
-        item["refreshedAt"] = json!(super::catalog::refresh_meta(kind).1);
-        results.push(item);
-    }
+    let results = super::catalog_refresh::refresh(store, accounts, providers, true).await;
+    seed_current_cline_defaults();
     results
 }
 

@@ -2,18 +2,25 @@
 //!
 //! ── 发送体为什么在转发前决定 ────────────────────────────────
 //! 请求体从 `api::chat` **原样**进来（去重键也取自原始请求体）。内容处理只在
-//! **凭证已就绪、即将发送之前**发生，按**两层**依次落到副本上：
+//! **凭证已就绪、即将发送之前**发生，按**三层**依次落到副本上：
 //!
+//!   ⓪ **角色归一层**（开发者角色兼容开关 `developerRoleCompat`）：把
+//!      `messages` 里 `role: "developer"` 的消息归一为 `"system"`（OpenAI
+//!      新版角色，自定义 OpenAI 兼容上游透传时认不全它）。开关关着或没有
+//!      developer 消息 → 原体直通，零拷贝路径不受影响。
 //!   ① **系统提示词层**（`core::prompt`）：按配置的模式（透传 / 替换 / 追加）
-//!      把网关自有提示词写进出站 body；降级期（`core::degrade`）改用最小中性
-//!      提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
+//!      把网关自有提示词写进出站 body；模式与提示词**可按提供商分别配置**
+//!      （`config::KEY_PROMPT_PROVIDERS`），未单独配置的家走全局那一份。
+//!      降级期（`core::degrade`）改用最小中性提示词。`passthrough` + 未降级时**一个字节都不动**（默认路径）。
 //!   ② **指纹脱敏层**（`core::sanitize`）：由全局开关
 //!      `sanitizeBlacklistFingerprints` 决定（快照见
 //!      [`ProviderContext::sanitize_fingerprints`]）：开关关着 → 原样；
 //!      开着 → 在副本上剥离/改写指纹。
 //!
-//! 顺序不能反（与参考项目一致）：脱敏在后，于是网关提示词自己万一命中指纹
-//! 也会被清掉。两层都在**副本**上做，客户端原始体（`ctx.body`）始终不变。
+//! ①② 顺序不能反（与参考项目一致）：脱敏在后，于是网关提示词自己万一命中指纹
+//! 也会被清掉。⓪ 排在它们之前：先归一角色，让后面各层与各适配器看到统一形态
+//! （适配器自己的 developer→system 映射对归一后的体是幂等的）。各层都在
+//! **副本**上做，客户端原始体（`ctx.body`）始终不变。
 //!
 //! 于是首选与故障转移到的家拿到的都是同一份处理结果；同一 provider **同池**
 //! 换账号重试复用同一份（不重复处理、不重复统计 —— 键是「家 × 账号池 ×
@@ -82,6 +89,14 @@ pub(super) struct ProviderContext<'a> {
     /// 否则用户在请求进行中改了设置，会出现「前一家脱敏过、后一家没脱敏」
     /// 这类语义漂移；快照也让判定与日志用的是同一份值。
     pub sanitize_fingerprints: bool,
+    /// 本次请求的**开发者角色兼容**开关快照（请求开始时取一次，与
+    /// `sanitize_fingerprints` 同一取舍：同一次请求内各家的判定必须一致）。
+    ///
+    /// 开启时 [`send_body`] 在最前面把 `messages` 里 `role: "developer"` 的消息
+    /// 归一为 `"system"`（OpenAI 新版 API 的角色；自定义 OpenAI 兼容上游是请求体
+    /// 原样透传的，不归一就会把 developer 原样发出去）。默认开，见
+    /// `config::KEY_DEVELOPER_ROLE_COMPAT`。
+    pub developer_role_compat: bool,
     /// 本次请求的**系统提示词决定**（模式 + 文本，请求开始时从配置快照取一次）。
     ///
     /// 与 `sanitize_fingerprints` 同一取舍：模式与文本在同一次请求内必须一致，
@@ -101,6 +116,19 @@ pub(super) struct ProviderContext<'a> {
     /// 语义不会中途漂移。传引用是因为它由 `upstream::forward` 的栈帧持有，
     /// 生命周期覆盖整条转发链。
     pub key_scope: Option<&'a crate::server::core::key_scope::KeyScope>,
+    /// 只准用这个账号（模型测试；`None` = 走全局优先级队列）。
+    ///
+    /// 与 `key_scope` 同一分工：它是「本次转发的收窄条件」，被选路与换号两处
+    /// 读同一份，语义不会中途漂移。收窄的语义见
+    /// [`super::ForwardRequest::pinned_account`] 与 `rotate::accounts_in_providers`。
+    pub pinned_account: Option<&'a str>,
+    /// 跳过按模型路由的启停门禁（模型测试的「未启用也能测」；语义与取舍见
+    /// [`super::ForwardRequest::ignore_model_gate`]）。候选链改从 `key_scope`
+    /// 白名单取 —— 它是唯一的候选来源，两处读的是同一份事实。
+    pub ignore_model_gate: bool,
+    /// 单次请求的出网代理临时覆盖（模型测试专用；`None` = 跟随账号配置，
+    /// `Some(None)` = 强制直连，`Some(Some(proxy))` = 强制走指定节点）。
+    pub proxy_override: Option<&'a Option<crate::server::core::proxies::ResolvedProxy>>,
 }
 
 /// 某一家 provider 实际要发送的请求体（**每次转发前**决定，不做跨家复用），
@@ -155,26 +183,50 @@ pub(super) fn send_body<'a>(
     account: Option<&Value>,
     degraded: bool,
 ) -> SendBody<'a> {
+    // ── ⓪ 角色归一层（开发者角色兼容开关）───────────────────────────
+    // 在所有改写**之前**：先把 developer 角色归一成 system，后面各层（提示词、
+    // 脱敏、各适配器）看到的就是统一形态 —— 适配器自己的 developer→system 映射
+    // 对归一后的体是幂等的，不会二次改写。开关关着或没有 developer 消息时
+    // 原体直接往下走（零拷贝），只有真要改才付出一次克隆。
+    let role_base: Cow<'a, Value> =
+        match normalize_developer_role(ctx.body, ctx.developer_role_compat) {
+            Some((next, changed)) => {
+                logging::verbose(
+                    "[Upstream]",
+                    &format!(
+                        "角色归一层：developer → system × {changed} 条 provider={provider_id}（开发者角色兼容）"
+                    ),
+                );
+                Cow::Owned(next)
+            }
+            None => Cow::Borrowed(ctx.body),
+        };
     // ── ① 系统提示词层（网关自有提示词：透传 / 替换 / 追加）──────────────
     // 在脱敏**之前**：与参考项目同序（提示词改写 → 脱敏），于是网关提示词
     // 自己万一命中指纹也会被后一层清掉；反过来的话，「刚换上去的那段提示词」
     // 就没人过一遍了。
     //
+    // 取**哪一份**是按家的（逐家覆盖见 `config::KEY_PROMPT_PROVIDERS`）：本函数
+    // 正是「某一家即将发送之前」那一刻，`provider_id` 就在手上，所以分派不需要
+    // 新的时机，只是把「哪一份」从全局换成这家自己的那一份。
+    //
     // `degraded` = 本请求是否已进入降级（请求开始时状态机已生效，或本次撞了
     // 内容拦截后由转发层置位）：降级期用最小中性提示词（`custom` 模式除外，
-    // 见 `PromptPlan::text_for`）。
-    let after_prompt = match ctx.prompt.apply(ctx.body, degraded) {
+    // 见 `PromptChoice::text_for`）。
+    let prompt = ctx.prompt.for_provider(provider_id);
+    let after_prompt = match prompt.apply(role_base.as_ref(), degraded) {
         Some(next) => {
             logging::verbose(
                 "[Upstream]",
                 &format!(
-                    "系统提示词层：{}（{}）messages {} → {}",
-                    ctx.prompt.mode.label(),
-                    if degraded && ctx.prompt.mode.degradable() {
+                    "系统提示词层：{}（{}）provider={} messages {} → {}",
+                    prompt.mode.label(),
+                    if degraded && prompt.mode.degradable() {
                         "降级期：中性提示词"
                     } else {
-                        ctx.prompt.source.label()
+                        prompt.source.label()
                     },
+                    provider_id,
                     message_count(ctx.body),
                     message_count(&next),
                 ),
@@ -185,7 +237,7 @@ pub(super) fn send_body<'a>(
         None => Cow::Borrowed(ctx.body),
     };
     // ── ② 指纹脱敏层（核心规则见 `core::sanitize`）─────────────────────
-    let mut body = match ctx.sanitize_fingerprints {
+    let body = match ctx.sanitize_fingerprints {
         true => match crate::server::core::sanitize::sanitize_body(after_prompt.as_ref()) {
             Some((scrubbed, hits)) => {
                 // 命中表可能为空：`sanitize_text` 末尾的去空白也能单独构成一次
@@ -199,6 +251,35 @@ pub(super) fn send_body<'a>(
             None => after_prompt,
         },
         false => after_prompt,
+    };
+    // ── ③ 原生（服务端执行）工具声明闸门 ──────────────────────────────
+    // 内置家是各家官方客户端的后端：官方客户端只声明 `type:"function"` 的函数
+    // 工具（联网搜索走客户端自己的链路），上游对原生工具类型的处理从「整轮 400」
+    // （CatPaw）到「静默剔除」（Qoder / Trae）都有 —— 所以统一在这里降级：
+    // 剔除 + 留痕，各家适配器看到的永远只有函数工具。
+    //
+    // 自定义家**不**走这道闸门（判据是 `is_custom_provider_id`）：chat 分支只剔
+    // 带标记的跨协议声明（透传是它的契约，见 `providers::custom::forward`），
+    // 翻译分支在出站转换器里自己处理。这里先剔会把客户端声明的 chat 方言原生
+    // 工具（智谱那套）也一并删掉，与透传契约矛盾。
+    // 日后若某家确认支持某个原生工具，在这里（唯一闸门）按家/按类型开白即可。
+    // 完整取舍见 `core::protocol::native_tool` 的模块头。
+    let mut body = if crate::server::core::custom_providers::is_custom_provider_id(provider_id) {
+        body
+    } else {
+        match crate::server::core::protocol::native_tool::downgrade(body.as_ref()) {
+            Some((next, dropped)) => {
+                logging::log(
+                    "[Upstream]",
+                    &dropped.describe(
+                        Some(provider_id),
+                        Some("本上游只承载 type:\"function\" 的函数工具"),
+                    ),
+                );
+                Cow::Owned(next)
+            }
+            None => body,
+        }
     };
     let requested = body
         .get("model")
@@ -254,13 +335,65 @@ fn message_count(body: &Value) -> usize {
         .unwrap_or(0)
 }
 
+/// 角色归一层：把 `messages` 里 `role: "developer"` 的消息改写为 `"system"`
+/// （开发者角色兼容，见 `config::KEY_DEVELOPER_ROLE_COMPAT`）。
+///
+/// 返回 `None` = 一个字节都没动（开关关着、没有 messages 数组、或里面没有
+/// developer 消息）—— 调用方继续沿用原始体，零拷贝路径不被打扰；`Some`
+/// 里是改写后的**完整副本**与改写条数。角色比较按小写折叠（与各协议适配器
+/// `responses_outbound` / `anthropic_outbound` 的既有映射同一口径），原值是
+/// `Developer` 这类大小写变体也一并归一。
+///
+/// 只有预检到 developer 消息才 clone 整个请求体：messages 通常是一份请求里
+/// 最大的一块，深拷贝只该发生在确实要写字的时候 —— 这也是本函数为什么不
+/// 接收 `&mut Cow`（像 `rewrite_model` 那样）而是返回 Option：开关关着时连
+/// `to_mut()` 的边界都不用碰。
+fn normalize_developer_role(body: &Value, enabled: bool) -> Option<(Value, usize)> {
+    if !enabled {
+        return None;
+    }
+    let messages = body.get("messages")?.as_array()?;
+    let hits = messages
+        .iter()
+        .filter(|message| {
+            message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role.eq_ignore_ascii_case("developer"))
+        })
+        .count();
+    if hits == 0 {
+        return None;
+    }
+    let mut next = body.clone();
+    let mut changed = 0usize;
+    if let Some(list) = next.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in list.iter_mut() {
+            if message
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| role.eq_ignore_ascii_case("developer"))
+            {
+                if let Some(slot) = message.get_mut("role") {
+                    *slot = Value::String("system".to_string());
+                    changed += 1;
+                }
+            }
+        }
+    }
+    (changed > 0).then_some((next, changed))
+}
+
 /// 把发送体里的 model 字段换成该 provider 认识的真名（仅当需要换时才复制）。
 ///
 /// `requested` 是请求名、`wire` 是 `catalog::wire_target_for_provider` 已经算好
-/// 的该家真名（调用方算一次，这里不再查目录）；只有两者不同时才把 `Cow`
-/// 升级成 Owned —— 常规路径（本名该家认识）保持借用零拷贝。
+/// 的该家真名（调用方算一次，这里不再查目录）；只有两者**逐字节相同**时才保持
+/// 借用零拷贝 —— 大小写不同**也必须改写**：目录里返回的精确大小写是上游认的
+/// id（Loomy 目录就是 `GLM-5.3-Flash`，客户端常发小写），只差大小写时不改，
+/// 上游会当成未知模型静默回落（实测：`glm-5.3-flash` 被回落成
+/// `deepseek-v4-flash-0731`，图片能力随之丢失）。
 fn rewrite_model(body: &mut Cow<'_, Value>, requested: &str, wire: &str, provider_id: &str) {
-    if wire.eq_ignore_ascii_case(requested) {
+    if wire == requested {
         return;
     }
     logging::verbose(

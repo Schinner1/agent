@@ -53,10 +53,10 @@
 //! 当前配置项（`apiKeys` / `modelRules` / `logRetentionDays` / `debugMode` /
 //! `sanitizeBlacklistFingerprints` / `promptMode` / `promptFile` /
 //! `scheduledTasks` / `autoCheckin` / `locale` / `lastRequestModel` /
-//! `providerRoute` / 三个 `*Dir` / 三个 `*RetentionDays` / 三个 `retry*` /
-//! 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 / 旧字段 `apiKey`）
-//! 与固定键**无冲突**，逐项核对过（全仓 `update_raw_field` / `raw.insert` /
-//! `KEY_*` 常量的取值集合 vs 下面的 `RESERVED_KV_KEYS`）。
+//! `providerRoute` / `updateProxy` / `updateBeta` / 三个 `*Dir` / 三个 `*RetentionDays` /
+//! 三个 `retry*` / 六条 `scheduledTasks.*` 子键 / 三个 `*Imported` 标记 /
+//! 旧字段 `apiKey`）与固定键**无冲突**，逐项核对过（全仓 `update_raw_field` /
+//! `raw.insert` / `KEY_*` 常量的取值集合 vs 下面的 `RESERVED_KV_KEYS`）。
 //! 后加固定键名时**必须**回来核对一次：撞名的代价是用户的配置或状态被静默
 //! 覆盖，而两处代码离得很远（一个在本文件，一个在使用方）。
 
@@ -100,9 +100,13 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // 状态」一类：不是配置项，配置写入绝不能动它。
     "panelAdmin",
     // 面板刷新令牌（server::access）：整份记录数组一个键（条目是个位数：
-    // 每设备一条活链），轮换/撤销都是整键重写。刷新令牌在库里只存 sha256，
-    // 重启后 access 短效令牌虽在内存丢失，浏览器用它静默换新。
+    // 每设备一条活链），轮换/撤销都是整键重写。刷新令牌在库里只存 sha256。
     "panelTokens",
+    // 面板 access 会话表（server::access）：与 `panelTokens` 同一形状、同样只存
+    // sha256。落库的理由是「重启不该把所有已登录的浏览器打成无效」—— 重启前它们
+    // 只在内存，重启后浏览器带着还在的 cookie 撞 401，而 401 又不清 cookie，
+    // 现场表现为「同一把对不上任何登录的指纹反复出现几十次」。
+    "panelAccessSessions",
     // ALTCHA 机器人校验的 HMAC 密钥（server::altcha）：首次签发 challenge
     // 时生成并落库，只经 HMAC 使用、从不外发。属于「其它零散状态」，
     // 配置写入绝不能动它。
@@ -126,10 +130,56 @@ pub const RESERVED_KV_KEYS: &[&str] = &[
     // —— 下次点「升级」会重复导入一遍历史明细。
     "requestsMigrated",
     "dailyMigrated",
+    // 模型用量口径订正的完成标记（request_stats::aggregate 的
+    // `MODEL_UPSTREAM_MARKER`）—— #139 的根因就是这个键漏登记：
+    // 它在 `remap_model_days` 里**直接写库**（与重算同一事务，有意的：
+    // 中断后标记必然没写、下次整批重跑），而 `config::init` 把全库读进内存
+    // 快照发生在那之前 —— 不登记的话，用户改任意一项配置时 `save_raw` 会把
+    // 它当「配置里已删掉的键」清掉，下次启动同一批历史被重算第二遍
+    // （日期键未变时是幂等覆盖、静默；变过日期键就留下重复的聚合行）。
+    "modelUsageUpstreamRemapped",
     // 远程模型清单的持久化缓存（core::providers::catalog_cache）：整份
     // 「各家上次成功拉到的清单」一个键（十份清单挤一个键的理由见那个模块头）。
     // 属于「其它零散状态」——它不是配置项，配置写入绝不能动它。
     "modelCatalogCache",
+    // 后台任务的持久化排期与执行状态（core::task_state）：整份「每条任务的
+    // 上次尝试 / 上次成功 / 下次执行 / 失败冷却 / 缓存值」一个键。它替代了
+    // 改造前「排期只在内存里、重启即从头」的形态 —— 于是重启不再让
+    // GitHub 检查、余额查询、模型刷新、凭证维护各多打一轮上游请求。
+    // 属于「其它零散状态」：配置写入绝不能动它（否则排期归零、重启又立刻重跑）。
+    "backgroundTaskState",
+    // 旧「定时查询积分」的结果快照（全局任务已退役）：键保留在保留清单里是
+    // 刻意的 —— `core::usage_records` 启动时把它的行导入 account_usage_records
+    // 表后删除本键；若那次迁移失败，这里不让配置写入把唯一的迁移来源误清掉。
+    // 迁移成功后这个键不再出现，条目留在清单里只是防御。
+    "usageQuerySnapshot",
+    // 出网代理池（core::proxy_pool）：整份 `{items: [...]}` 一个键 ——
+    // 「网络代理」页维护的命名代理，账号可按 id 引用。属于「其它零散状态」：
+    // 它不是配置项（配置写入绝不能动它，否则用户配好的代理会被改一次 API Key
+    // 清空）。条目不落独立表、只整份读写，理由见那个模块头。
+    "proxyPool",
+    // 代理设置（core::proxy_settings）：`{listenerPortBase, listenerPortEnd,
+    // testUrl}` 一个键 —— 「网络代理」页设置弹窗维护的节点监听端口范围与
+    // 出口测试网址。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能
+    // 动它（否则用户改一次 API Key 端口范围就退回默认、大订阅又分配不出端口）。
+    "proxySettings",
+    // 订阅（core::subscriptions）：整份 `{items: [...]}` 一个键 —— 「网络代理」
+    // 页「订阅管理」维护的订阅链接，内核（sub_kernel）拉起时从 api 层拿启用
+    // 清单。与 proxyPool 同类零散状态：不是配置项，配置写入绝不能动它。
+    "subscriptions",
+    // OfficeAce 模型可用性探测的结论（core::providers::officeace::probe）：
+    // 整份 `{unavailable:[…], probedAt, account}` 一个键。探测「目录里列着、这个
+    // 号实际打不通」的模型（上游回 81004/81009），结论由 `advertise_models` 用来
+    // 默认隐藏它们。属于「其它零散状态」——不是配置项，配置写入绝不能动它
+    // （否则每次改配置都让隐藏集合清零、客户端又照着一个一个试）。
+    "officeaceModelProbe",
+    // models.dev 模型元数据的刷新结果（core::model_meta::snapshot）：整份
+    // 「上次成功拉到的精简索引」一个键（文件形态与内嵌快照逐字相同，生成口径见
+    // `scripts/sync-modelsdev.mjs`）。**不是**配置项 —— 配置写入绝不能动它，
+    // 否则用户改一次 API Key 就退回发版时那份更旧的内嵌快照。
+    // 与上面的 `modelCatalogCache` 是两码事：那个存各家上游的**模型清单**，
+    // 这个存模型的**元数据**（能力位 / 思考档位），刷新链路与失效语义各不同。
+    "modelsDevCatalog",
 ];
 
 /// 这个键是否属于「其它零散状态」（即不归网关配置管）。
@@ -177,7 +227,90 @@ pub fn is_reserved(key: &str) -> bool {
 /// 见 [`V6_SCHEMA`]。同样是既有表加列（ALTER 两连）。这两列只在**在途**
 /// 期间有值，收尾时一律清空（见 `request_stats::sql` 的各条收尾语句）——
 /// 「有没有阶段」因此就是「这一行还在跑」的第二个读数，与 status=0 同进同退。
-pub const SCHEMA_VERSION: i64 = 6;
+///
+/// ── 版本 7：requests 表加「测试来源」一列 ─────────────────────
+/// 见 [`V7_SCHEMA`]。同样是既有表加列（单条 ALTER）。模型测试走的是真实转发
+/// 链路，它产生的请求会照常进请求日志 —— 这一列把它与真实流量分开，
+/// 于是报表聚合能把它排除（测试是人工反复发起的样本，混进去会把真实流量读歪），
+/// 而请求日志那边照旧能看到它、并标成「测试」。
+/// ── 版本 8：account_usage_records 表（每账号的余额查询记录）─────
+/// 见 [`V8_SCHEMA`]。与 v3 同一形态（新表，`CREATE TABLE IF NOT EXISTS`，
+/// 老库与全新库都会跑这一版建出它）。它取代旧 kv 快照 `usageQuerySnapshot`
+/// 成为「每账号最近一次余额查询结果」的权威存放处：全局「定时查询积分」
+/// 退役后查询按账号各自到期触发，一行一账号才能逐条更新、逐条被选路读取
+/// （kv 整份读改写撑不住这个粒度）。旧快照的数据由 `core::usage_records`
+/// 启动时导入，升级后余额列不会变空白。
+///
+/// ── 版本 11：checkin_records 表（签到记录的每账号明细台账）───────
+/// 见 [`V11_SCHEMA`]。与 v3 / v8 同一形态（新表，`CREATE TABLE IF NOT EXISTS`）。
+/// 它是签到中心「签到记录」页的数据源：每执行一次签到，每个账号一行
+/// （领成功 / 已领过 / 失败及其错误原文 / 收益文案），补上改造前「只有
+/// config.json 里一条聚合同 lastResult」看不见的明细。写入方是
+/// `core::checkin_records`（记账点唯一：`core::billing::checkin::run_checkin`）。
+///
+/// ── 版本 12：requests 补「来源客户端」一列 ─────────────────────
+/// 见 [`V12_SCHEMA`]。与 v5 / v10 同一形态（既有表加列，单条 ALTER）。
+/// 请求日志的「客户端」列读它：入口 handler 从下游 `User-Agent` 按
+/// `core::client` 的规则表判出客户端类型（`Codex` / `ZCode` / `Claude Code`
+/// …），随记账落库。存归类结果而不是原始 UA：UA 带版本号，逐条存既撑大
+/// 明细也读不出「是谁」。旧行 DEFAULT '' = 没有记录（那时还没采集），
+/// 展示层显示占位符 —— 不给旧数据猜值。
+///
+/// ── 版本 13：清空 `request_raw` 的历史正文（一次性空间回收）─────
+/// 预览对话的下游正文从本版起改为**仅调试模式开启时采集**
+/// （对齐 OmniProxy 的口径：不开调试模式就不保存任何原始正文），而升级前
+/// 无条件采集下来的那批正文在此清空 —— 它们对用户不再有意义（新语义下也
+/// 不会有新数据填补开关关闭的时段），留着只白占空间。
+///
+/// 注意这一版是**数据动作**而不是结构变更（表结构一字未动）。放在 schema
+/// 版本里而不是启动期的 kv 标记：两者都「只跑一次」，但版本号是既有的幂等
+/// 机制（`user_version` 与语句同事务提交），复用它就是零新增状态 —— 那条
+/// kv 标记会变成第二个「这条数据动作跑过没有」的事实来源。
+///
+/// 语句不写成 `*_SCHEMA` 常量而在 `apply_version` 的 v13 分支里单独执行：
+/// 要拿**被删的行数**，`migrate` 据此决定是否紧跟着 VACUUM（把空闲页真正
+/// 还给文件系统 —— 光 DELETE 不会让库文件缩小，而「省空间」正是这一版的
+/// 目的），完整说明见 `migrate` 尾部那段。
+///
+/// ── 版本 14：账号 `data` 列改为密文（`core::crypto` 的 `enc1:` 信封）──
+/// 这一版**没有任何 DDL**，也不清任何历史行（`cleaned_raw_rows` 写 0）：
+/// 它只是一个**内容形态的标记**。`accounts.data` 从明文 JSON 变成 AES-256-GCM
+/// 密文，而这件事没有列要加、没有表要建 —— 加密是逐行的内容变换，由
+/// `core::account_store::store_admin::encrypt_legacy_accounts`（挂在
+/// `account_bootstrap::run` 的启动迁移里）把存量明文行就地加密；密钥在库外
+/// （`{config_dir}/account.key`，兜底 `AGENT2API_ACCOUNT_KEY`，见
+/// `core::crypto` 模块头）。所以 `apply_version` 的 v14 分支是空操作。
+///
+/// **为什么仍要占一个版本号**（而不是只靠那段启动迁移）：因为「库里的数据形态」
+/// 真的变了，而 `user_version` 是它唯一的事实来源。升到 14 的库，其 `data` 列
+/// 应被当成密文；这条事实**在旧程序那一侧才有用** —— `migrate` 新加的「库版本
+/// 高于程序版本就拒绝打开」判据（见 [`migrate`]）正建立在版本号上：旧程序
+/// （`SCHEMA_VERSION <= 13`）读到 v14 库会明确失败，而不是把密文当坏数据跳过、
+/// 再在写回时把「读不出来的行」当成「内存里没有」DELETE 掉（即「回退一次 =
+/// 账号被删」）。对本程序，v14 只是一次空操作。
+///
+/// ── 版本 15：requests 补两条索引（`status` 与报表窄列覆盖）─────
+/// 见 [`V15_SCHEMA`]。两条索引都来自同一次实测：明细三万余行、库已经四百多
+/// MB 的库上，两个最热的读路径分别在整表扫描与逐行回表。
+///
+///   · `idx_requests_status`：`SELECT COUNT(*) FROM requests WHERE status = 0`
+///     在**没有任何索引可用**时对整表做 `SCAN`（实测 3 万行 50 ms 量级，
+///     而命中的通常只有个位数行）。这条语句不属于报表 —— 它是前端「进行中」
+///     徽标的全局轮询（每 5 秒一次，与当前停在哪个页面无关，见 `ui/app.js`
+///     的 `syncRunningRequests`）与请求日志列表每次查询的一部分。加索引后
+///     按 status 直接定位，不再扫全表。
+///   · `idx_requests_summary`：`/api/stats/summary` 的近 24 小时明细窗口
+///     （`request_stats::sql::select_summary_rows`）只需要 6 列，而非覆盖索引
+///     必须逐行回表 —— 明细行里躺着 KB 级的 `route` / `attempt_details`，
+///     回表读回来的几乎全是被随后丢掉的字节。这条索引让该查询变成**纯索引
+///     扫描**（列序与那条 SELECT 的列序一致，改动任一侧都要回来对一眼）。
+///
+/// 两条都是 `CREATE INDEX IF NOT EXISTS`（与其余版本的幂等纪律一致）：在存量库
+/// 上建索引要扫一遍表，代价与表大小成正比、只付一次；`requests` 只有几万行时
+/// 在百毫秒量级，不会让启动明显变慢。**不要把这两条往 [`V1_SCHEMA`] 里补**：
+/// 新库按 1→15 依次跑，v15 那一步同样会建出来，而 v1 里多写一份等于同一条索引
+/// 有了两处定义 —— 将来改一处忘一处，正是 `V4_SCHEMA` 那类错位的来源。
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -378,8 +511,8 @@ CREATE INDEX IF NOT EXISTS idx_debug_traffic_ts ON debug_traffic(ts);
 ///
 /// ── 为什么用 ALTER 而不重建表 ────────────────────────────────
 /// 两张表的其它列与索引一个都不动，重建要「建新表 → 搬数据 → 删旧表 → 重建索引」，
-/// 而 `requests` 可能有几万行（`MAX_ENTRIES` = 20000）。ALTER ADD COLUMN 是
-/// SQLite 的元数据操作（常数时间、不重写数据），代价可以忽略。
+/// 而 `requests` 是全量保留的明细表（长期使用可达几万甚至几十万行）。
+/// ALTER ADD COLUMN 是 SQLite 的元数据操作（常数时间、不重写数据），代价可以忽略。
 ///
 /// ── 为什么这里不能写 IF NOT EXISTS ───────────────────────────
 /// SQLite 的 `ALTER TABLE ... ADD COLUMN` **不支持** `IF NOT EXISTS`（这是它与
@@ -410,11 +543,15 @@ ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 /// 版本 3：`request_raw` 表 —— 请求/响应的**下游侧**原始正文（预览对话功能的地基）。
 ///
 /// ── 它和 debug_traffic 表是什么关系 ──────────────────────────
-/// `debug_traffic`（调试报文）是**调试模式专用**的上游侧报文（头部脱敏、
-/// 有全局字节闸、开关关闭时完全不采集）；本表是**始终采集**的下游侧正文
-/// （客户端发来的请求体 + 网关下发的响应体），供请求日志的「预览对话」弹窗
-/// 用。两表按同一个 `id`（请求关联 id）各存各的，谁也不依赖谁 ——
-/// `core::debug_traffic` 的现有行为一字未动，本表是纯粹的并行补充。
+/// `debug_traffic`（调试报文）是调试模式的**上游侧**报文（头部脱敏、
+/// 有全局字节闸）；本表是**下游侧**正文（客户端发来的请求体 + 网关下发的
+/// 响应体），供请求日志的「预览对话」弹窗用。两表按同一个 `id`（请求关联 id）
+/// 各存各的，谁也不依赖谁。
+///
+/// ── 采集条件：与调试模式同一个开关（v13 起）───────────────────
+/// 正文**只在调试模式开启时采集**（对齐 OmniProxy 的口径：不开调试模式就不
+/// 保存任何原始正文）—— 关着时连截断转换都不做，采集路径零开销。v13 之前的
+/// 版本是无条件采集的，那批历史正文已由 v13 一次清空（见 [`SCHEMA_VERSION`]）。
 ///
 /// ── 为什么独立成表而不是给 requests 加两列 ────────────────────
 /// 正文是大字段（两侧各 128 KiB 上限），明细列表的每次分页都要取
@@ -432,10 +569,10 @@ ALTER TABLE requests ADD COLUMN sensitive_hits TEXT NOT NULL DEFAULT '[]';
 /// `sqlite3` 命令行里直接看（排障的主要用法）。
 ///
 /// ── 为什么没有索引（连 ts 都不建）────────────────────────────
-/// 本表只有两种读法：按主键 id 取单行（主键自带）、按「保留最新 N 行」裁剪
-/// （2000 行的表全排序是微秒级）。唯一会按 ts 范围查它的是清理预览的计数，
-/// 那条走的是 `id IN (SELECT id FROM requests ...)` 主键查找。表有行数硬闸，
-/// 不会长到大到需要索引。
+/// 本表只有两种读法：按主键 id 取单行（主键自带）、清理时按
+/// 「`id IN (SELECT id FROM requests …)`」定位（主键查找）。唯一的全表扫描是
+/// 用户手动清空（`DELETE FROM request_raw`），而正文只在调试模式开启期间写入
+/// —— 表的增长由那个开关天然约束，不会长到需要为检索建索引。
 const V3_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS request_raw (
   id            TEXT PRIMARY KEY,
@@ -480,7 +617,7 @@ ALTER TABLE requests ADD COLUMN upstream_reasoning TEXT NOT NULL DEFAULT '';
 /// ── 存什么 ──────────────────────────────────────────────────
 ///   - `phase`：该请求当前所处的转发阶段，取值是 `core::upstream::usage::
 ///     LogPhase` 的四个字面量（`connecting` 连接中 / `waiting` 等待响应 /
-///     `streaming` 响应中 / `retrying` 重试中）；空串 = 不在途（终态行、
+///     `streaming` 响应中 / `retrying` 重试中 / `queued` 排队中）；空串 = 不在途（终态行、
 ///     旧行、以及转发前就失败从未插入过在途行的行）。
 ///   - `phase_started_at`：**进入当前阶段**的时刻（毫秒时间戳，与 `ts`
 ///     同一口径）。阶段计时（请求日志状态列第二行）由它算出来。
@@ -510,20 +647,228 @@ ALTER TABLE requests ADD COLUMN phase TEXT NOT NULL DEFAULT '';
 ALTER TABLE requests ADD COLUMN phase_started_at INTEGER;
 ";
 
+/// 版本 7：`requests` 补一列（schema v7）—— 这条请求是不是**模型测试**发起的。
+///
+/// ── 存什么 ──────────────────────────────────────────────────
+/// `is_test = 1`：这条明细来自模型管理页的「测试」（`api::model_test`）；
+/// `0`（默认，含全部旧行）：真实流量。
+///
+/// ── 为什么要有它（而不是靠「模型名 / 来源」猜）────────────────
+/// 测试请求与真实请求**走的是同一条转发链路**（这正是测试的价值：结论与生产
+/// 同源），所以它们在明细里长得一模一样 —— 模型、账号、状态码、用量全都真实。
+/// 唯一能分开它们的就是「这次是谁发起的」，而那只有入口知道。报表按天聚合
+/// （`request_stats` 的 `fold_into_daily` 与 `rebuild_day`）据此跳过测试行，
+/// 请求日志则照常显示并标出来。
+///
+/// 加列走 ALTER 的全部理由（为什么不动 v1 的 DDL、为什么不能写
+/// IF NOT EXISTS、幂等靠版本号）与 [`V2_SCHEMA`] 完全相同，不赘述。
+const V7_SCHEMA: &str = "
+-- ── requests 补一列（schema v7）──────────────────────────────
+ALTER TABLE requests ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;
+";
+
+/// 版本 8：account_usage_records 表 —— 每账号一条余额查询记录（一账号一行，
+/// 主键即账号 id，重复写入天然是 UPSERT）。
+///
+/// 存什么：`usage` 是适配器返回的**归一化余额 JSON 原文**（与 `/api/accounts/usage`
+/// 行里的 `usage` 同一份形状，前端按它渲染余额列），`error` / `code` 是失败行的
+/// 原因与机器标记（与快照行同语义）。`remaining` 是从 usage 里提出的**数字**投影
+/// （归一化家 = `available`，workbuddy 既有形状 = `totalLeft`）：转发选路的
+/// 「余额不足跳过」每条请求都要比一次，从 JSON 里现场解析太奢侈，主键查一列即可；
+/// `unlimited` 单独一列，workbuddy 的 ∞ 账号不参与阈值判定。
+///
+/// ── 为什么 `remaining` 只在成功时覆写 ────────────────────────
+/// 失败行保留上次成功的数值：欠费判定不因「这次查询失败」而放行（避免
+/// 「查询失败 → 放行 → 402」的窗口期），恢复需要查询成功且数值回到阈值之上。
+/// 失败本身的展示信息在 `error` / `code` 里，二者互不覆盖。
+///
+/// 为什么时间是 INTEGER 毫秒而不是 DATETIME：调度判定（到期 = 上次尝试 +
+/// 间隔）要的是可直接比较的毫秒数，与 `logging::now_ms` 同一口径，读出来即用。
+const V8_SCHEMA: &str = "
+-- ── account_usage_records：每账号的余额查询记录（schema v8）──
+CREATE TABLE IF NOT EXISTS account_usage_records (
+  account_id      TEXT PRIMARY KEY,
+  usage           TEXT,
+  error           TEXT,
+  code            TEXT,
+  remaining       REAL,
+  unlimited       INTEGER NOT NULL DEFAULT 0 CHECK (unlimited IN (0, 1)),
+  last_success_at INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL DEFAULT 0
+);
+";
+
+/// 版本 9：给 `requests` 补「按账号 + 时间」的聚合索引。
+///
+/// ── 它服务什么 ──────────────────────────────────────────────
+/// 账号限制器的 **Token 消耗规则**：每条规则问的是「这个账号在当前重置窗口
+/// （对齐自然时间的固定窗口，30 分钟 ~ 24 小时）内一共消耗了多少 Token」——
+/// 一次 `SELECT account_id, SUM(total_tokens) FROM requests
+/// WHERE account_id = ? AND ts >= ?` 的聚合。没有这个索引它只能走
+/// `idx_requests_ts` 全表扫到过滤条件上，限制器的心跳刷新（每 10 秒一轮）
+/// 会把请求明细表整个翻一遍。
+///
+/// 为什么是复合索引 `(account_id, ts)` 而不是只补 `account_id`：窗口过滤
+/// （`ts >= 窗口起点`）要在**同一账号内**做范围扫描，复合索引让聚合变成
+/// 一次有序的范围读；单独的 account_id 索引拿到行号后还得回表逐行比 ts。
+///
+/// 聚合查询的全部调用方：`core::limiter` 的窗口刷新（按 distinct 周期分组
+/// 查）与单账号即时复查（自动禁用判定）。
+const V9_SCHEMA: &str = "
+-- ── requests 补按账号聚合的索引（schema v9）──────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
+";
+
+/// 版本 10：requests 补「选路决策快照」一列。
+///
+/// 存整个决策 JSON 的原文（`{strategy, sticky, stickyHit, picked, ordered[],
+/// blocked[]}`，采集侧已截断到各有界条数）。DEFAULT NULL：旧行与「没走到
+/// 选路」的请求都是「没有决策」—— 展示层对两者不渲染同一段，与
+/// `attempt_details` 的 `'[]'` 不同（那表达「空表」是有意的信息，这里 NULL
+/// 就是「没这回事」，不必造一种空形态）。
+const V10_SCHEMA: &str = "
+-- ── requests 补选路决策快照列（schema v10）───────────────────
+ALTER TABLE requests ADD COLUMN route TEXT;
+";
+
+/// 版本 11：checkin_records 表 —— 签到记录的**每账号明细台账**。
+///
+/// 存什么：每执行一次签到（定时条目轮次 / 启动补签 / 手动批量 / 单账号 /
+/// 国际版活动领取），每个账号落一行。列的口径：
+///   - `ts`：记账时刻（毫秒，`logging::now_ms` 同口径；排序与翻页游标）；
+///   - `date`：北京时间 `YYYY-MM-DD`（上游自然日，`core::beijing` 的日期键 ——
+///     「哪天的签到」按它算，跟机器时区无关，与调度判定同一份口径）；
+///   - `source`：触发来源 `schedule / startup / manual / single / activity`
+///     （见 `core::checkin_records` 的模块头），界面显示为「来源」列；
+///   - `reason`：给日志看的那句（「到点触发（08:00）」「手动签到」…），原样存；
+///   - `account_id` / `account_name` / `provider`：账号三件套（结果行里就有，
+///     原样复制；账号删除后历史行仍然可读）；
+///   - `outcome`：`success / already / pending / failed`（判定复用签到执行体的
+///     同一对判据，判据只此一份，见 `core::checkin_records::classify`）；
+///   - `ok`：`success|already → 1` 的布尔投影（「今日已完成」口径的 SQL 过滤列，
+///     免得每个读点都写 `(outcome='success' OR outcome='already')`）；
+///   - `message`：claim.msg 原文（「今日积分 +100」等**收益就在这里**）；
+///   - `error`：执行错误原文（失败行的原因）；
+///   - `kept_active`：国际版保活成功标记（保活对话 `pokeSucceeded` 或网页
+///     会话 `webConversation.succeeded` 任一，见 `checkin_records::kept_active_of`）。
+///
+/// 为什么 row_id 用 AUTOINCREMENT：与 `requests` 同一理由 —— 它当翻页游标，
+/// 复用 rowid 会让「翻页漏行 / 重行」。
+///
+/// 索引三个（ts / outcome / provider），对应记录页固定的三种过滤维度，
+/// 刻意不做复合索引（与 logs 表同一取舍：组合多、量级小，让 SQLite 自己挑）。
+const V11_SCHEMA: &str = "
+-- ── checkin_records：签到记录的每账号明细台账（schema v11）────
+CREATE TABLE IF NOT EXISTS checkin_records (
+  row_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts           INTEGER NOT NULL,
+  date         TEXT NOT NULL DEFAULT '',
+  source       TEXT NOT NULL DEFAULT '',
+  reason       TEXT NOT NULL DEFAULT '',
+  account_id   TEXT NOT NULL DEFAULT '',
+  account_name TEXT NOT NULL DEFAULT '',
+  provider     TEXT NOT NULL DEFAULT '',
+  outcome      TEXT NOT NULL DEFAULT '',
+  ok           INTEGER NOT NULL DEFAULT 0,
+  message      TEXT,
+  error        TEXT,
+  kept_active  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_ts ON checkin_records(ts);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_outcome ON checkin_records(outcome);
+CREATE INDEX IF NOT EXISTS idx_checkin_records_provider ON checkin_records(provider);
+";
+
+/// 版本 12：requests 补「来源客户端」一列（schema v12）。
+///
+/// 与 v5 / v7 / v10 同一形态（既有表加列，单条 ALTER，幂等靠版本号）：
+/// `client` 存入口从下游 `User-Agent` 判出的客户端类型（`core::client`），
+/// 请求日志的「客户端」列读它。DEFAULT ''：旧行与「请求没带 UA」的路径都是
+/// 空串 —— 两者在展示层的处理相同（占位符），不必分两种形态。
+const V12_SCHEMA: &str = "
+-- ── requests 补来源客户端列（schema v12）─────────────────────
+ALTER TABLE requests ADD COLUMN client TEXT NOT NULL DEFAULT '';
+";
+// v13 没有对应的 `*_SCHEMA` 常量：它只有一条 DELETE，且在 `apply_version`
+// 的分支里用 `execute` 单独执行（要拿被删行数），语句就在那里 —— 见
+// `SCHEMA_VERSION` 的 v13 段。
+
+/// 版本 15：requests 补两条索引（schema v15）。
+///
+/// 与 v9 同一形态（既有表加索引，`CREATE INDEX IF NOT EXISTS`，幂等靠版本号）。
+/// 两条索引各自的来历与代价见 [`SCHEMA_VERSION`] 的 v15 段。
+///
+/// `idx_requests_summary` 的列序 = `sql::SUMMARY_COLUMNS` 的列序**加前缀
+/// `ts, is_test`**：`ts` 在最前才能支撑 `WHERE ts >= ? AND ts <= ?` 的范围扫描，
+/// `is_test` 紧随其后是为了在索引内就过滤掉模型测试行（不必回表才知道要丢）。
+/// 其余 5 列（`model` / `upstream_model` / `total_tokens` / `cache_read_tokens`
+/// / `prompt_tokens`）就是报表要读的全部内容 —— 少一列就要回表，多一列白占
+/// 空间与写入开销。
+const V15_SCHEMA: &str = "
+-- ── requests 补 status 索引（schema v15）─────────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status);
+-- ── requests 补报表窄列覆盖索引（schema v15）─────────────────
+CREATE INDEX IF NOT EXISTS idx_requests_summary ON requests(
+  ts, is_test, model, upstream_model, total_tokens, cache_read_tokens, prompt_tokens
+);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
+///
+/// **库版本高于本程序时返回 `Err` 拒绝打开**（v14 起有意反转的一条既有决定，
+/// 完整论证见函数体里那个分支的注释）：加密后的 `accounts.data` 被旧程序当坏
+/// 数据跳过、再被它的差异写当成「内存里没有」删掉，静默放行等于「回退一次 =
+/// 账号被删」。库版本**低于**本程序则照常逐版本升级；**等于**则空操作。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
 /// 是唯一消费点，它把错误包成一句人能读的话（`format!`）就够了；而这里需要
 /// 区分「读版本号失败 / 跑 DDL 失败 / 写版本号失败」三种，保留 rusqlite 的
-/// 错误类型（含 SQLite 的错误码与消息）才说得清是哪一步坏的。
+/// 错误类型（含 SQLite 的错误码与消息）才说得清是哪一步坏的。那句「库比程序新」
+/// 的拒绝理由用 `ToSqlConversionFailure` 承载（它的 `Display` 就是原话）。
 pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     let current: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if current >= SCHEMA_VERSION {
-        // 版本比本二进制新（用户从新版回退到旧版）：**不报错、也不动库**。
-        // 报错会让旧版直接起不来（用户只是想回退一次），而「降级 schema」
-        // 意味着删列删表，那是不可逆的数据丢失 —— 两者都不该自动发生。
+    if current == SCHEMA_VERSION {
+        // 已是最新版：什么都不做（全新库跑完建表之后、已升级的库每次启动都走这里）。
         return Ok(());
     }
+    if current > SCHEMA_VERSION {
+        // ── 库比程序新：**拒绝打开**（本切片有意反转的一条既有决定）─────────
+        //
+        // 改造前这里的口径是「不报错、也不动库」：理由写的是「用户从新版回退到
+        // 旧版，报错会让旧版直接起不来，而他只是想回退一次」。那条理由在
+        // `accounts.data` 是明文的年代成立 —— 旧程序读不懂新库的新列/新表，
+        // 但账号那几张表它写得回去，最坏是丢一点新功能的数据。
+        //
+        // **本版起它不再成立**：`accounts.data` 是 `enc1:` 密文（v14 起），而旧程序
+        // （`SCHEMA_VERSION <= 13`）的 `decode_data` 只认明文 JSON —— 于是：
+        //   1. 旧程序读出每一行都会失败，把它们**当成坏数据跳过** → 界面上账号
+        //      全部消失；
+        //   2. 更致命的是写路径：旧程序的 `save_state` 按 id 做差异写，「库里有、
+        //      内存状态里没有」的行会被 `DELETE FROM accounts WHERE id = ?` ——
+        //      它读不出来的那些密文行**恰好**落进这个分支。于是「回退一次并触发
+        //      任意一次账号写入」= 把加密后的账号**静默删光**。
+        // 静默放行等于「回退一次 = 账号被删」，而账号数据丢了是不可逆的用户损失
+        // —— 所以这里改成明确失败：让启动在日志里说清原因，用户退回去用新版。
+        //
+        // 这不是「降级 schema」（那才需要删列删表、不可逆，本函数从没做过，也不
+        // 会做）：这里只是**在动手之前先拒绝**，库文件一个字节都不碰。
+        //
+        // 用什么承载这句错误：`ToSqlConversionFailure` 的 `Display` 就是里面那句
+        // 话的原文（本仓既有手法，见 `db::migrate::logs::assign_log_id` 的说明），
+        // 于是 `Db::open` 的 `format!("建表/升级 schema 失败: {error}")` 会把这段
+        // 话原样带到启动日志里。
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            format!(
+                "库 schema 版本（{current}）高于当前程序（{SCHEMA_VERSION}）：这通常是回退到了旧版本。\
+                 请使用更新的程序，或从备份恢复——用旧程序打开会把加密后的账号静默删除。"
+            )
+            .into(),
+        ));
+    }
+    // v13 清掉的历史正文行数（0 = 这一轮什么都没删）：循环后据此决定是否
+    // VACUUM（见本函数尾部那段）。放循环外是因为 VACUUM 不能在事务里跑。
+    let mut cleaned_raw_rows = 0usize;
     for version in (current + 1)..=SCHEMA_VERSION {
         // 每个版本一个独立事务：DDL 与版本号必须一起生效或一起不生效，
         // 否则中断后会出现「表已建、版本号还是旧的」（下次启动重跑 DDL，
@@ -540,21 +885,44 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         // 写事务的独占性由 SQLite 自己保证（同一连接上不允许第二条语句并发），
         // 不是靠 Rust 的独占借用。
         let tx = conn.unchecked_transaction()?;
-        apply_version(&tx, version)?;
+        apply_version(&tx, version, &mut cleaned_raw_rows)?;
         tx.pragma_update(None, "user_version", version)?;
         tx.commit()?;
+    }
+    if cleaned_raw_rows > 0 {
+        // ── 删完之后顺手 VACUUM 一次（v13 的「省空间」在这里真正落地）──
+        // `DELETE` 只是把行标成空闲页，库文件**不会缩小** —— 对「升级后马上想
+        // 看到磁盘降下来」的用户，只有 VACUUM（重建整库文件）才把空闲页还给
+        // 文件系统。触发条件是 `cleaned_raw_rows > 0`：全新库（表本来就空）与
+        // 已升过级的库都删 0 行、不付这个代价；只有「确实有历史正文被清掉」的
+        // 那次升级会做一遍整库重建（几十 MB 的库通常秒级，一次性成本）。
+        //
+        // VACUUM 不能在事务里，所以放在循环外（每个版本的事务都已提交）；
+        // 失败**不报错**：数据已经删掉了，回收空间是尽力而为的优化 —— 用户
+        // 之后仍可在请求日志页的「清理」弹窗里手动压缩（那条路有后台线程与
+        // 进度状态，见 `RequestStats::compact`）。
+        let _ = conn.execute_batch("VACUUM;");
     }
     Ok(())
 }
 
-/// 执行某个版本的 DDL。**新增版本时在这里加一个分支**，并在上面写好该版本的
-/// 建表/改表语句常量。
+/// 执行某个版本的 DDL / 数据动作，并把「清掉的历史正文行数」带回给 `migrate`
+/// （只有 v13 会写非零值，其余版本写 0）。**新增版本时在这里加一个分支**，
+/// 并在上面写好该版本的建表/改表语句常量。
+///
+/// `cleaned_raw_rows` 做成出参而不是返回值：绝大多数分支只是跑一段 DDL、
+/// 没有数据要上报，若改成 `Result<usize>` 则每个分支都得包一层 `Ok(0)`
+/// （形式噪音），出参让「只有关心它的那一版」写它。
 ///
 /// `_` 分支返回 Ok 而不是 unreachable!：版本号是外部输入（库文件可能来自
 /// 更新的二进制，被旧版读到），越过 [`SCHEMA_VERSION`] 的版本不该 panic。
 /// `migrate` 的主循环也不可能走到这里（循环上界就是 SCHEMA_VERSION），
 /// 所以这个分支实际是「调用方传了越界的 version」的防御。
-fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
+fn apply_version(
+    conn: &Connection,
+    version: i64,
+    cleaned_raw_rows: &mut usize,
+) -> rusqlite::Result<()> {
     match version {
         1 => conn.execute_batch(V1_SCHEMA),
         // v2：requests 补两个 JSON 文本列（重试链 / 敏感词命中）。
@@ -569,6 +937,40 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         5 => conn.execute_batch(V5_SCHEMA),
         // v6：requests 补阶段与阶段计时两列（在途请求的状态列读数，见 V6_SCHEMA）
         6 => conn.execute_batch(V6_SCHEMA),
+        // v7：requests 补「测试来源」一列（模型测试的流量标记，见 V7_SCHEMA）
+        7 => conn.execute_batch(V7_SCHEMA),
+        // v8：account_usage_records 每账号余额记录表（取代旧 kv 快照，见 V8_SCHEMA）
+        8 => conn.execute_batch(V8_SCHEMA),
+        // v9：requests 补按账号聚合的索引（限制器的 Token 周期消耗聚合，见 V9_SCHEMA）
+        9 => conn.execute_batch(V9_SCHEMA),
+        // v10：requests 补「选路决策快照」一列（请求详情的路由回放，见 V10_SCHEMA）
+        10 => conn.execute_batch(V10_SCHEMA),
+        // v11：checkin_records 签到记录明细台账（签到记录页的数据源，见 V11_SCHEMA）
+        11 => conn.execute_batch(V11_SCHEMA),
+        // v12：requests 补「来源客户端」一列（请求日志的客户端列，见 V12_SCHEMA）
+        12 => conn.execute_batch(V12_SCHEMA),
+        // v13：清空预览对话的历史正文（一次性空间回收，见 SCHEMA_VERSION 的
+        // v13 段）。先重放 v3 建表：存量库里有「版本号不低、request_raw 表却
+        // 缺失」的个例（v4 就是为修它而加的）—— 对那种库直接 DELETE 会报
+        // 「no such table」并把整个版本事务回滚，迁移就卡死了。
+        // 用 `execute` 而不是 `execute_batch`：要拿被删行数带出去，`migrate`
+        // 据此决定是否紧跟着 VACUUM（光 DELETE 不会让库文件缩小）。
+        13 => {
+            conn.execute_batch(V3_SCHEMA)?;
+            *cleaned_raw_rows = conn.execute("DELETE FROM request_raw", [])?;
+            Ok(())
+        }
+        // v14：账号 `data` 列改为密文（`enc1:` 信封）。
+        // **这一版没有 DDL**，所以是空操作：加密是逐行的内容变换（由启动迁移
+        // `account_store::store_admin::encrypt_legacy_accounts` 把存量明文行就地
+        // 加密），没有列要加、没有表要建、也没有历史行要删（`cleaned_raw_rows`
+        // 保持 0，不触发 VACUUM）。版本号的作用在**旧程序那一侧**：它让旧程序
+        // 读到 v14 库时明确失败（见 `migrate` 的拒绝分支），而不是把密文当坏
+        // 数据跳过后又删掉。完整说明见 [`SCHEMA_VERSION`] 的 v14 段。
+        14 => Ok(()),
+        // v15：requests 补两条索引（status 的定位 + 报表窄列的覆盖，见
+        // V15_SCHEMA 与 SCHEMA_VERSION 的 v15 段）。
+        15 => conn.execute_batch(V15_SCHEMA),
         _ => Ok(()),
     }
 }

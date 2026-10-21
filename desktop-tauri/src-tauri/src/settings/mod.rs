@@ -97,18 +97,46 @@ pub struct AppSettings {
     pub autostart: bool,
     /// 网关监听端口。
     ///
-    /// 0 = 未设置，回落到默认 3065（与 `gateway::proxy_port()` 的语义一致）。
+    /// 0 = 未设置，回落到构建形态的默认端口（release 3065 / debug 3066，
+    /// 与 `gateway::proxy_port()` 的语义一致）。
     /// 存这里而不是后端配置：端口决定**壳侧**管理客户端的连接目标，且要在
     /// 服务端 bind 之前就读到，属于「应用级启动设置」而非网关业务配置。
     /// 改这个值需要重启进程才生效（服务端 bind 之后端口改不了）。
     pub proxy_port: u16,
+    /// 允许局域网访问：监听 `0.0.0.0` 而不是 `127.0.0.1`（issue #48）。
+    ///
+    /// 默认 false（单机安全边界，桌面壳的历史语义）。开启的前提是面板管理员
+    /// 已注册（`change_lan_access` 命令把关）：监听地址一旦出了回环，`/api/*`
+    /// 的免鉴权语义不再成立，必须靠管理员会话 + API Key 认证兜底 —— 这套
+    /// 闸门在 `backend::ensure_ready` 里按本字段开启。
+    /// 改这个值需要重启进程才生效（监听地址在 bind 之后就改不了）。
+    pub lan_access: bool,
+    /// 局域网访问开启时是否同时托管网页管理面板（网关端口出 `ui/` 静态目录，
+    /// 远程浏览器可打开面板管理；远程登录走面板自己的管理员注册 / 登录）。
+    /// 默认 false：桌面端是电脑端应用，只把 `/v1/*` 网关出给局域网，
+    /// 面板仍由 Tauri 壳自己出。仅在本字段为 true 时有意义。
+    pub lan_panel: bool,
+    /// 轻量模式：关闭到托盘时**销毁**主窗口（连带退出 WebView2 那 6 个常驻
+    /// 进程、释放约 200MB 内存），点托盘图标时再按同一份参数重建界面。
+    ///
+    /// 网关在进程内（`server/` crate），销毁窗口不影响转发与定时任务；
+    /// 但跑在 WebView 里的「ZCode 活动套餐验证码令牌池」随之停止 ——
+    /// 该通道的请求会以 503 落进请求日志（文案会指明需要打开主窗口补令牌）。
+    /// 仅在 `close_to_tray` 开启时有意义（关闭即退出时窗口不存在「轻量」一说）。
+    ///
+    /// 开机自启 + 本开关同时开启时，**启动期就不建窗口**（只起托盘与后端，
+    /// 点托盘再按同一份参数重建）：自启路径不经过关窗，若照常建窗（哪怕
+    /// 隐藏），WebView2 也会常驻，轻量模式就要等一次完整的「开窗→关窗」才
+    /// 兑现。代价同上（令牌池在打开窗口前不补货）。
+    /// 默认 false。
+    pub lightweight_mode: bool,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         // 关闭到托盘默认开启：网关的价值在于后台持续转发，
         // 用户点关闭通常只是想收起界面，而不是让转发中断
-        Self { close_to_tray: true, autostart: false, proxy_port: 0 }
+        Self { close_to_tray: true, autostart: false, proxy_port: 0, lan_access: false, lan_panel: false, lightweight_mode: false }
     }
 }
 

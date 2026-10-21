@@ -117,11 +117,11 @@
      内容永远占不满；vw 相对整个窗口，于是窗口 ≤1280px 时内容占满、
      更宽时才收在这个值上并居中。
      值不要往 90vw 以上调：侧边栏吃掉约 13% 的窗口宽度后，92vw 在 3200px 以下
-     永远碰不到，限宽等于失效 —— 宽屏上各页直接铺到窗口边，只有账号页
-     （自带 1400px 限宽）还留着左右留白，看起来像两个版本。80vw 才是
+     永远碰不到，限宽等于失效 —— 宽屏上各页直接铺到窗口边，版心就没了。80vw 才是
      「各页都收在版心里、左右都有留白」的那个口径。
-     这个变量只描述内容区的限宽，全站所有页面（含账号页）一律用它，
-     不存在按页面的覆盖。 */
+     这个变量只描述内容区的限宽，全站所有页面一律用它，不存在按页面的覆盖
+     （账号页曾自带一条 max-width: 1400px，已删：它比那张表自身的下限还窄，
+     只换来「横滚条常驻 + 比别的页窄一截」，见 page-accounts.css）。 */
   --content-max: 80vw;
   --sb-w: 11px;          /* 滚动条宽度：表头对齐要靠它补偿 */
 }
@@ -287,13 +287,37 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* 720px 是桌面 Tauri 窗口的最小宽度下限（窗口不允许再拖窄）。手机上照抄会
+   把整个文档撑到 720px 宽：375px 的视口里只露出中间 375px 的一段，左右两边
+   各被裁掉 172px —— 用户看到的「页面看不全」就是这一条造成的，而且它发生在
+   任何媒体查询之外，光靠 @media (max-width:767px) 覆盖不掉级联。
+   真机视口按浏览器给的实际宽度走，窗口最小宽度由 Tauri 自己管（Web 端没有
+   窗口这个概念，body 不该替它设下限）。 */
+@media (max-width: 767px) {
+  body { min-width: 0; }
+}
+
+/* ─── 移动端：从「app-shell 固定视口」切成「正常文档流」───
+   桌面端 body 不滚（height:100% + overflow:hidden），滚动发生在 .page.active 里；
+   但这个结构在手机上会把用户困在容器里 —— 滚到底后惯性滚动被 .content 的
+   overflow:hidden 截断，外面的页脚 / 顶栏永远滑不到。改成正常文档流后 body
+   自己滚，所有页面内容按内容高度自然生长，用户想滑多远就滑多远。
+   侧栏 / 顶栏 / 面板头保持原样（侧栏本来就是 position:fixed，不受影响）。 */
+@media (max-width: 767px) {
+  html, body { height: auto; overflow: visible; }
+  body { overflow-y: auto; -webkit-overflow-scrolling: touch; }
+}
+
 h1, h2, h3, h4, p { margin: 0; }
 
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
 code, kbd { font-family: var(--font-mono); font-size: .93em; }
 
-/* hidden 属性必须压过组件自身 display，否则弹窗 / 进度块会默认露出来 */
+/* hidden 属性必须压过组件自身 display，否则弹窗 / 进度块会默认露出来。
+   注意：组件库产物（islands/ui.css）的工具类是分层 + !important 的，分层里的
+   重要声明反压未分层的重要声明 —— 那里需要同层压制的规则写在组件库自己的
+   globals.css（见 [data-slot='dialog-content'][hidden]）。 */
 [hidden] { display: none !important; }
 
 :focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--r-sm); }

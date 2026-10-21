@@ -12,7 +12,7 @@
 //! ```
 //!
 //! ── 为什么 zcode 平面两地**相同**、推理平面两地不同 ─────────
-//! 登录与「周末套餐」领取都发生在 ZCode 自己的服务端（`zcode.z.ai`），
+//! 登录、领取与余额查询都发生在 ZCode 自己的服务端（`zcode.z.ai`），
 //! 两地客户端用的是**同一个** `zcode.z.ai`（OAuth 的 `provider` 字段区分
 //! `zai` / `bigmodel`，见 `oauth.rs`）。而真正跑推理的网关是各自开放平台的
 //! 编码套餐端点：国内 `open.bigmodel.cn`、国际 `api.z.ai`。
@@ -122,10 +122,37 @@ impl Region {
         }
     }
 
-    /// 开放平台业务域（API Key 解析用；参考实现的 `bizHost`）
-    pub fn biz_host(self) -> &'static str {
+    /// 开放平台**监控平面**基址（额度窗口读数用，见 `monitor.rs`）。
+    ///
+    /// ── 为什么两地不同、为什么是这两个域 ────────────────────────
+    /// `/api/monitor/usage/quota/limit` 是**未公开**端点，第三方实现给出的是
+    /// 一对域，且多个独立项目完全一致：国际 `api.z.ai`、国内 `open.bigmodel.cn`
+    /// （CodexBar 的 z.ai 文档、opencode-glm-quota 的 `PI_ZAI_CODING_CN_USAGE_ENDPOINT`、
+    /// zai-limits 的说明）。国内那个正是本家 `openai_base_url` 的域 ——
+    /// 也就是说监控平面与**推理平面同域**，只是路径不同（`/api/monitor/...`
+    /// vs `/api/coding/paas/v4/...`）。
+    ///
+    /// `ZCODE_MONITOR_BASE_URL` / `ZCODE_INTL_MONITOR_BASE_URL` 可覆盖
+    /// （与 `openai_base_url` 同一个口子：上游改域时用户能自己救急，不必等发版）。
+    pub fn monitor_base_url(self) -> &'static str {
         match self {
             Self::Cn => "https://open.bigmodel.cn",
+            Self::Intl => "https://api.z.ai",
+        }
+    }
+
+    /// 编码套餐业务域（凭证换取用，见 `coding_key.rs`）。
+    ///
+    /// ── 国内版为什么是 `bigmodel.cn` 而不是 `open.bigmodel.cn` ──
+    /// 参考实现里这两个域是分开的：它的 `ProviderDef.bizHost` 字段是
+    /// `open.bigmodel.cn`（那是给另一处「API Key 解析」用的），而真正跑登录
+    /// 换取的 `resolver.resolveCodingPlanCredential` **硬编码**了
+    /// `https://bigmodel.cn`。本函数服务的正是后者那条链，因此取后者。
+    /// 两个域实测都能响应 `/api/biz/*`（假令牌下返回同一种 401 文案），
+    /// 但既然有实测跑通的那一个，就没有理由去猜另一个。
+    pub fn biz_host(self) -> &'static str {
+        match self {
+            Self::Cn => "https://bigmodel.cn",
             Self::Intl => "https://api.z.ai",
         }
     }

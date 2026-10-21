@@ -70,6 +70,15 @@ pub(super) fn is_desktop_item(item: &Map<String, Value>) -> bool {
 /// 缺字段 / null / 空串 → 历史数据兼容为 WorkBuddy（旧导出文件没有 provider）；
 /// 非空但不是注册表已知 id → Err（绝不把未知 id 当成 WorkBuddy 存进 WorkBuddy 组）。
 ///
+/// ── 拆家前的旧导出要按地区纠正（2026-10）──────────────────────
+/// WorkBuddy 拆家前只有一家，国际版账号在导出文件里长这样：
+/// `{"provider": "workbuddy", "edition": "intl", ...}`。那份 provider 字段
+/// 描述的是「旧版本里唯一的那一家」，不是「这条账号属于国内版」——
+/// 照字面导进去会把国际版账号塞回国内版组（凭证是国际版的，转发会稳定打错
+/// 站点），因此这里按记录自己的 `edition` 归位。国内版（含 edition 缺失）
+/// 归位结果仍是 `workbuddy`，行为逐字不变；显式写了 `workbuddy-intl` 的
+/// 新导出不受影响（那已经是拆家后的权威归属）。
+///
 /// **例外：`custom-` 前缀**（自定义提供商）。它是运行期数据、刻意不进注册表
 /// （见 `custom_providers` 模块头），按注册表判会被整条拒掉 —— 那正是自定义
 /// 账号「导得出、导不回」的根子。这里放行前缀，存在性校验由调用方在合并完
@@ -88,6 +97,12 @@ pub(super) fn resolve_provider(item: &Map<String, Value>) -> Result<String, Stri
                 return Err(format!(
                     "未知的提供商 id「{trimmed}」：注册表不认识，不能当作 WorkBuddy 导入"
                 ));
+            }
+            if trimmed == DEFAULT_PROVIDER_ID {
+                let region = crate::server::core::providers::workbuddy::Region::from_edition_id(
+                    item.get("edition").and_then(Value::as_str),
+                );
+                return Ok(region.provider_id().to_string());
             }
             Ok(trimmed.to_string())
         }
@@ -131,7 +146,9 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
     let uid = text("uid");
     let login_name = text("loginName");
     let user_id = text("userId");
-    if provider == kind_id(ProviderKind::WorkBuddy) {
+    // 「workbuddy 系」= 国内版 + 国际版：两家身份字段同形（uid），
+    // 见 `providers::workbuddy::is_workbuddy_family` 的说明
+    if crate::server::core::providers::workbuddy::is_workbuddy_family(provider) {
         if uid.is_empty() {
             return Err("缺少 uid（无法标识 WorkBuddy 账号）".to_string());
         }
@@ -146,6 +163,19 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 uid 与 loginName（无法标识 CatPaw 账号）".to_string());
     }
+    // Kuku：账号标识是 `uid`（= userreport 的 uk，本家 id 也从它派生），缺则
+    // loginName —— 与 CatPaw 同一套字段口径。没有这一支会落进兜底按 `userId`
+    // 取，而本家记录没有该字段：账号导得出去、导不回来（报「缺少 userId」整条
+    // 失败）。
+    if provider == kind_id(ProviderKind::Kuku) {
+        if !uid.is_empty() {
+            return Ok(uid);
+        }
+        if !login_name.is_empty() {
+            return Ok(login_name);
+        }
+        return Err("缺少 uid 与 loginName（无法标识 Kuku 账号）".to_string());
+    }
     // Cline 的账号标识落在 `account`（邮箱或 `usr-…` id）而不是 `userId`
     // —— 见 `account_store::cline_accounts` 的公开形态。少了这一支，
     // Cline 账号导出后再导入会因「缺少 userId」整条失败。
@@ -157,20 +187,53 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 account（无法标识 Cline 账号）".to_string());
     }
+    // CodeArts：`domain_id + user_id` 两段身份 —— 与 `codearts_accounts::same_identity`
+    // 的判重口径逐字一致。只按 userId 会把**同一个人不同华为云账号（域）下的两条**
+    // 并成一条：导入时后一条覆盖前一条，而被覆盖那条的一次性 refresh token
+    // 就此作废（不是"少一条记录"，是"烧掉一份登录凭据"）。
+    if provider == kind_id(ProviderKind::CodeArts) {
+        let user_id = text("userId");
+        if user_id.is_empty() {
+            return Err("缺少 userId（无法标识 CodeArts 账号）".to_string());
+        }
+        return Ok(format!("{}\u{0}{}", text("domainId"), user_id));
+    }
     // Qoder：地区 + userId 两段身份（与 `qoder_accounts` 添加路径的判重口径
     // 一致 —— 只按 userId 会把同一个人在两个地区的账号并成一条）。
-    if provider == kind_id(ProviderKind::Qoder) {
+    // 拆家后两个地区是两家 provider（`qoder` / `qoder-intl`），判据按家族走；
+    // 地区仍从记录字段读（`mode` / `edition`），与 provider id 互为印证 ——
+    // 迁移保证了存量记录两者一致。
+    if crate::server::core::account_store::is_qoder_family(provider) {
         if user_id.is_empty() {
             return Err("缺少 userId（无法标识 Qoder 账号）".to_string());
         }
         let region = match qoder_region(item) {
             Ok(Some(region)) => region,
-            Ok(None) => "global".to_string(),
+            Ok(None) => {
+                // 键缺失：按 **provider id** 推（拆家后它是权威；导入条目
+                // 一律带 provider），provider 也不认识时按国际版兜底（与
+                // 添加路径对缺失 mode 的旧缺省一致）。
+                crate::server::core::providers::qoder::endpoints::Region::from_provider_id(provider)
+                    .map(|region| region.id().to_string())
+                    .unwrap_or_else(|| "global".to_string())
+            }
             Err(()) => {
                 return Err("Qoder 地区无法识别（mode / edition 必须是 global 或 cn）".to_string())
             }
         };
         return Ok(format!("{region}:{user_id}"));
+    }
+    // Trae：账号标识是 `uid`（与 workbuddy / catpaw 同类，落在 uid 而不是 userId），
+    // 且判重口径是 **(variant, uid) 两段** —— 见 `trae_accounts::add_trae_account`：
+    // 同一个人可以在 solo 与 cn 两个谱系各有一条记录，只按 uid 会把两条并成一条。
+    // 少了这一支的话，本家账号导得出去、导不回来（落到下面的 userId 兜底，
+    // 报「缺少 userId（无法标识 trae 账号）」整条失败）。
+    if provider == kind_id(ProviderKind::Trae) {
+        if uid.is_empty() {
+            return Err("缺少 uid（无法标识 Trae 账号）".to_string());
+        }
+        let variant = text("variant");
+        return Ok(format!("{}:{uid}", if variant.is_empty() { "solo" } else { &variant }));
     }
     // 自定义提供商：凭证就是身份 —— apiKey 非空时与添加路径「同 key 合并」
     // 完全同口径（添加路径的账号 id 就是 key 的 SHA-256 前缀）；空 key 没有
@@ -186,6 +249,22 @@ pub(super) fn identity_of_item(provider: &str, item: &Map<String, Value>) -> Res
         }
         return Err("缺少 apiKey 与 id（无法标识自定义提供商账号）".to_string());
     }
+    // Command Code：凭证就是身份 —— API Key 落盘在 `accessToken`（添加路径的
+    // 账号 id 就是 key 的 SHA-256 前缀，与自定义家同构），记录上没有
+    // userId / uid / apiKey 键。没有这一支会落进兜底按 `userId` 取 → 报
+    // 「缺少 userId」整条失败；空 token 的记录退到账号 id（与自定义家
+    // 「缺 apiKey 用 id」同口径）。
+    if provider == kind_id(ProviderKind::CommandCode) {
+        let access_token = text("accessToken");
+        if !access_token.is_empty() {
+            return Ok(access_token);
+        }
+        let id = text("id");
+        if !id.is_empty() {
+            return Ok(id);
+        }
+        return Err("缺少 accessToken 与 id（无法标识 Command Code 账号）".to_string());
+    }
     if user_id.is_empty() {
         return Err(format!("缺少 userId（无法标识 {provider} 账号）"));
     }
@@ -200,7 +279,7 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
         .unwrap_or("")
         .trim()
         .to_string();
-    if provider == kind_id(ProviderKind::WorkBuddy) {
+    if crate::server::core::providers::workbuddy::is_workbuddy_family(provider) {
         let uid = record.uid().trim().to_string();
         return (!uid.is_empty()).then_some(uid);
     }
@@ -210,6 +289,29 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
             return Some(uid);
         }
         return (!login_name.is_empty()).then_some(login_name);
+    }
+    // Kuku：uid（缺则 loginName）—— 与 `identity_of_item` 同口径
+    if provider == kind_id(ProviderKind::Kuku) {
+        let uid = record.uid().trim().to_string();
+        if !uid.is_empty() {
+            return Some(uid);
+        }
+        return (!login_name.is_empty()).then_some(login_name);
+    }
+    // Trae：`uid` + variant 两段身份（与 `identity_of_item` 同口径 —— 两处
+    // 缺省都必须按 `solo` 算，否则导出去的同一条账号会在判重时对不上）。
+    if provider == kind_id(ProviderKind::Trae) {
+        let uid = record.uid().trim().to_string();
+        if uid.is_empty() {
+            return None;
+        }
+        let variant = record
+            .get("variant")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Some(format!("{}:{uid}", if variant.is_empty() { "solo" } else { &variant }));
     }
     // Cline：身份在 `account` 键上（与 `identity_of_item` 同一口径，两池共用）
     if crate::server::core::account_store::is_cline_family(provider) {
@@ -222,16 +324,19 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
         return (!account.is_empty()).then_some(account);
     }
     // Qoder：地区 + userId（与 `identity_of_item` 同口径，地区取 `mode` /
-    // `edition`，键缺失按国际版 —— 两处缺省必须一致）。地区值非法的记录视为
-    // 无法识别身份（不参与匹配，导入按新增走；正常数据不会出现这种记录）。
-    if provider == kind_id(ProviderKind::Qoder) {
+    // `edition`，键缺失按 provider id 推、再退国际版 —— 两处缺省必须一致）。
+    // 地区值非法的记录视为无法识别身份（不参与匹配，导入按新增走；正常数据
+    // 不会出现这种记录）。
+    if crate::server::core::account_store::is_qoder_family(provider) {
         let user_id = record.user_id().trim().to_string();
         if user_id.is_empty() {
             return None;
         }
         let region = match qoder_region(record.fields()) {
             Ok(Some(region)) => region,
-            Ok(None) => "global".to_string(),
+            Ok(None) => crate::server::core::providers::qoder::endpoints::Region::from_provider_id(provider)
+                .map(|region| region.id().to_string())
+                .unwrap_or_else(|| "global".to_string()),
             Err(()) => return None,
         };
         return Some(format!("{region}:{user_id}"));
@@ -246,6 +351,16 @@ pub(super) fn identity_of_record(provider: &str, record: &StoredAccount) -> Opti
             .to_string();
         if !api_key.is_empty() {
             return Some(api_key);
+        }
+        let id = record.id().trim().to_string();
+        return (!id.is_empty()).then_some(id);
+    }
+    // Command Code：accessToken（= API Key）即身份，缺则账号 id ——
+    // 与 `identity_of_item` 同口径
+    if provider == kind_id(ProviderKind::CommandCode) {
+        let access_token = record.access_token().trim().to_string();
+        if !access_token.is_empty() {
+            return Some(access_token);
         }
         let id = record.id().trim().to_string();
         return (!id.is_empty()).then_some(id);
@@ -307,4 +422,44 @@ pub(super) fn allocate_priority(used: &[i64]) -> Option<i64> {
         return Some(candidate);
     }
     (MIN_PRIORITY..=MAX_PRIORITY).find(|value| !normalized.contains(value))
+}
+
+#[cfg(test)]
+mod tests {
+    //! 这里只测**身份判定**本身（导入/导出两段的口径是否一致），不测整条导入链
+    //! —— 后者要临时库与账号文件，`api::accounts` 那侧已有覆盖。
+    use serde_json::json;
+
+    use super::*;
+
+    fn item(fields: serde_json::Value) -> Map<String, Value> {
+        fields.as_object().expect("对象").clone()
+    }
+
+    #[test]
+    fn trae_identity_is_variant_plus_uid_and_never_falls_through_to_userid() {
+        // 回归本家那条"导得出去、导不回来"：兜底按 `userId` 取身份，
+        // 而 Trae 的记录只有 `uid`（与 workbuddy / catpaw 同类）。落进兜底的
+        // 症状是导入时报「缺少 userId（无法标识 trae 账号）」整条失败。
+        assert_eq!(
+            "solo:51029416092912",
+            identity_of_item(
+                "trae",
+                &item(json!({"uid": "51029416092912", "variant": "solo", "userId": ""}))
+            )
+            .expect("应识别出身份")
+        );
+        assert_eq!(
+            "cn:51029416092912",
+            identity_of_item("trae", &item(json!({"uid": "51029416092912", "variant": "cn"}))).expect("应识别出身份"),
+            "两个谱系是同一个人也是两条记录（与 add_trae_account 的判重口径一致）"
+        );
+        // variant 缺失时**必须**与 `identity_of_record` 的缺省同一个值，
+        // 否则同一条账号在导出侧与本机侧算出两个身份，判重失效 → 重复添加。
+        assert_eq!(
+            "solo:777",
+            identity_of_item("trae", &item(json!({"uid": "777"}))).expect("缺 variant 按 solo"),
+        );
+        assert!(identity_of_item("trae", &item(json!({"uid": "  ", "userId": "51029416092912"}))).is_err(), "空 uid 不能拿 userId 凑");
+    }
 }

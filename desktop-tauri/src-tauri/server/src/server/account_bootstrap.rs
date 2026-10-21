@@ -39,15 +39,24 @@
 //! 键与自家账号列表），所以两处都调不会做两遍活。
 //!
 //! ── 顺序（有一处真实依赖，别随手调）───────────────────────────
-//! 与改造前的启动顺序逐字一致，其中最后两条有依赖：
-//!   `auth.json` → `migrate_startup`（整队/拆池）→ `migrate_cline_split`
-//!   → raccoon → catpaw → autoclaw
+//! 与改造前的启动顺序逐字一致，其中最后几条有依赖：
+//!   `auth.json` → `migrate_startup`（整队/拆池/拆家）→ 历史账号凭证加密
+//!   → 历史网关 Key 加密 → 顶层 `apiKey` 原地加密 → `migrate_cline_split`
+//!   → 网关 Key 白名单补齐 → raccoon → catpaw → autoclaw
+//!   - 三条「形态加密」（账号凭证 / 网关 Key 数组 / 网关 Key 旧字段）紧随
+//!     `migrate_startup` 之后、且排在彼此相邻：第一条收尾它没碰到的历史明文行，
+//!     后两条只碰 kv 里的 `apiKeys` 与顶层 `apiKey`，互不依赖、也都不依赖后面的
+//!     语义迁移（写入侧从本轮改造起本来就是密文）。
 //!   - `migrate_cline_split` 必须排在 `migrate_startup` **之后**：后者会把
 //!     Cline 的账号 id 拆成 `cline-free` / `cline-pass`，前者改的是规则键
 //!     （`modelRules` 里按 provider id 记账的 disabled / hidden / mappings /
 //!     seeded）—— 顺序反了，规则会在「账号还是旧 id」的状态下被判一遍池，
 //!     两边对不上。
-//!   - 它还必须读**已经导入过配置**的那份快照：升级路径里的调用点已经先做过
+//!   - 网关 Key 白名单补齐与它同一条依赖（读 `kv` 的 `apiKeys`），且**只依赖
+//!     provider id 的改名**（`workbuddy` → `workbuddy` + `workbuddy-intl`），
+//!     与账号数据的先后无关；排在这里是为了让「拆家带来的三处存量修补」
+//!     （账号归属、模型规则、Key 白名单）在同一段里一眼看得全。
+//!   - 它们还必须读**已经导入过配置**的那份快照：升级路径里的调用点已经先做过
 //!     `config::reload()`（见 `api::upgrade_api`），启动路径里 `config::init`
 //!     早就装好了快照（`read_raw` 会回落读旧文件），两处都成立。
 //!   - 三家旧项目导入排在 `migrate_startup` 之后：那时历史账号已经归好组，
@@ -65,11 +74,90 @@ pub(crate) fn run(store: &AccountStore) {
     //   ② 优先级去重 —— 逐 provider 分组重编号，相对顺序保持不变
     //      （所以升级后实际转发顺序不变）
     //   ③ Cline 拆池改名（`provider: "cline"` + `pool` → cline-free / cline-pass）
+    //   ④ WorkBuddy 拆家（`provider: "workbuddy"` + `edition: "intl"` → workbuddy-intl）
     store.migrate_startup();
+    // 历史明文账号行的整列加密（见 store_admin::encrypt_legacy_accounts）：
+    // `accounts.data` 从本轮改造起写的是 `enc1:` 密文，而升级前已在库里的行仍是
+    // 明文 JSON（读侧 `decode_data` 兼容明文，所以那期间账号照常可用）。这一步把
+    // 过渡态收敛掉 —— 之后「拷走库文件」就看不到任何凭证。
+    //
+    // 位置在 `migrate_startup` **之后**：那一轮会按差异重写改了字段的行（写出的
+    // 已经加密），剩下没被它碰到的历史行由这一步收尾。本身幂等（判据是数据自证，
+    // 没有 kv 标记）、失败不阻断启动（密钥不可用时记日志返回，下次启动重试）。
+    store.encrypt_legacy_accounts();
+    // 网关 Key 的历史明文加密（见 `core::api_keys::encrypt_legacy_keys`）：
+    // `apiKeys` 里每把 Key 的 `key` 从本轮改造起写的是 `enc1:` 密文，而升级前
+    // 已在配置里的仍是明文（读侧 `from_value` 兼容明文，所以那期间 Key 照常可用）。
+    // 这一步把过渡态收敛掉 —— 之后「拷走库文件」就看不到网关口令。
+    //
+    // 位置与上一条**并列**（账号那一轮加密的后面）：两者互不依赖，只是同为
+    // 「同一批本机凭证的形态迁移」，排在一起让这一组一眼看得全。它读
+    // `config::current().raw()`，因此**必须等配置快照就位**：启动路径里
+    // `config::init` 在 bootstrap 开头就已经装好（早于本函数被调用），升级路径里
+    // 调用方先做过 `config::reload()`（见 `api::upgrade_api`），两条路都成立 ——
+    // 与同在这段里的 `add_intl_to_workbuddy_allowlists` 是同一条依赖。
+    // 本身幂等（判据是数据自证：还有没有明文 key）、失败不阻断启动（密钥不可用时
+    // 记日志返回，本次 Key 照常可用，下次启动重试），与上一条同一形态。
+    crate::server::core::api_keys::encrypt_legacy_keys();
+    // 顶层旧字段 `apiKey` 的**原地**加密（见 `core::legacy_api_key`）：与上一条同族的
+    // 第三条「形态加密」—— `apiKeys` 数组与顶层 `apiKey` 是同一把「网关口令」的两种
+    // 形态，排在一起让这一组一眼看得全。依赖与失败语义跟上一条逐字相同：
+    // 读 `config::current().raw()`（所以同样必须等配置快照就位，两条路都成立，
+    // 见上一条的说明）、幂等（判据是数据自证：值还不是 `enc1:` 信封）、
+    // 失败只记日志不阻断启动（本次 Key 照常可用，下次启动重试）。
+    // 它**只换值**：字段名留在 `apiKey`、不搬进数组 —— 搬了会破坏「写侧一旦动过
+    // 列表才落成 `apiKeys` 并删掉 `apiKey`」这条既有语义（完整论证在新模块的模块头）。
+    crate::server::core::legacy_api_key::encrypt_legacy_api_key();
     // 模型规则的同一轮迁移（见模块头的顺序说明）：它改的是 `kv` 里的
     // `modelRules`，所以必须读**已经导入过配置**的那份快照。
     if let Some(summary) = model_rules::migrate_cline_split() {
         logging::log("[Models]", &summary);
+    }
+    // WorkBuddy 拆家（2026-10）的三条存量迁移：统一挂在一次性标记下。
+    // 模型规则 / 网关 Key 白名单 / 按家提示词覆盖拆家前都由 `workbuddy` 一个 id
+    // 覆盖两个地区，因此都要把那份配置**复制**给国际版。
+    // **必须成组只跑一次**（见 `config::workbuddy_split_migrated` 的论证）：
+    // 「一边有、另一边没有就补一份」的判据在拆家之后一直成立，不设标记会在每次
+    // 启动把用户之后新做的国内版配置反复镜像过去。
+    // 顺序：规则在前（它决定模型能不能被点名），另两条互不依赖。
+    //
+    // 与种子的先后无关（有意）：国际版的种子可能已经在
+    // `restore_cached_catalogs` 里跑过并把大部分模型默认禁用，因此规则迁移的
+    // 启停同步是「以国内版为准」而不是「只补缺失」—— 见那个函数的说明。
+    if !crate::server::config::workbuddy_split_migrated() {
+        let (outcome, rules_summary) = model_rules::migrate_workbuddy_split();
+        let patched_keys = crate::server::core::api_keys::add_intl_to_workbuddy_allowlists();
+        let prompt_summary = crate::server::config::migrate_workbuddy_split_prompt_providers();
+        if let Some(summary) = rules_summary {
+            logging::log("[Models]", &summary);
+        }
+        if !patched_keys.is_empty() {
+            logging::log(
+                "[Keys]",
+                &format!(
+                    "🔑 已为 {} 把网关 Key 补上「WorkBuddy 国际版」的可用提供商（拆家前 workbuddy 覆盖两地，限制范围保持不变）：{}",
+                    patched_keys.len(),
+                    patched_keys
+                        .iter()
+                        .map(|entry| entry.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                ),
+            );
+        }
+        if let Some(summary) = prompt_summary {
+            logging::log("[Prompt]", &summary);
+        }
+        // 规则迁移**没落盘**时不写标记（下次启动重来一次，好过让用户的启停状态
+        // 停在半迁移位置）。另两条各自独立落盘，失败也只影响自己。
+        if outcome.allows_marking_done() {
+            if !crate::server::config::mark_workbuddy_split_migrated() {
+                logging::log(
+                    "[Models]",
+                    "⚠️  WorkBuddy 拆家迁移标记未能落盘：下次启动会再核对一遍（三条迁移都幂等，不会重复改动）",
+                );
+            }
+        }
     }
     // 限额冷却键的存量修复：把按**请求名**记下的键（映射别名）清掉。
     //

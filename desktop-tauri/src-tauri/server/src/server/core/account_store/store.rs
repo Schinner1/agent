@@ -39,7 +39,9 @@ use crate::server::core::account_store::state::{
 };
 use crate::server::core::endpoints::resolve_edition;
 use crate::server::core::providers::DEFAULT_PROVIDER_ID;
-use crate::server::core::proxies::{resolve_account_proxy, ProxyResolution};
+use crate::server::core::proxies::{
+    resolve_account_proxy, resolve_account_proxy_rotating, ProxyResolution, ResolvedProxy,
+};
 use crate::server::db::Db;
 
 /// 账号存储错误（对应 Node 版 AccountStoreError，带状态码 → 路由层直接用）。
@@ -501,7 +503,17 @@ impl AccountStore {
                 record.expires_at().unwrap_or(0.0),
             ),
         };
-        json!({
+        // ── ZCode 的三个附加键（`zcode::plan` 用）────────────────────
+        // 它家有**两条上游通道**（编码套餐走开放平台、活动套餐走 `zcode.z.ai`
+        // 的 Anthropic 端点），而适配器只能看到会话 —— 走哪条通道、用哪套凭证
+        // 都从这里读。条件是「记录属于 ZCode 系」，因此对别家的会话是**逐字
+        // 空操作**（连键都不会多）：
+        //   - `jwt`：活动套餐通道的 Bearer（与 `accessToken` 不能互相替代）；
+        //   - `deviceMid`：进请求体的 `metadata.user_id.device_id`；
+        //   - `zcodePlan`：通道名（缺失 = 编码套餐，见 `zcode::plan_of`）。
+        // 空值不写：会话里出现空串会让「有没有这条通道的凭证」的判定变成
+        // 「键在不在」，那是两个不同的问法。
+        let mut session = json!({
             "endpoint": record.endpoint().unwrap_or_else(|| edition.endpoint.to_string()),
             "prefixPath": record
                 .prefix_path()
@@ -525,7 +537,86 @@ impl AccountStore {
                 "enterpriseId": record.enterprise_id(),
                 "enterpriseName": record.enterprise_name(),
             },
-        })
+        });
+        if crate::server::core::providers::zcode::region::Region::from_provider_id(
+            &record.provider(),
+        )
+        .is_some()
+        {
+            if let Some(object) = session.as_object_mut() {
+                for (key, value) in [
+                    ("jwt", record.jwt()),
+                    ("deviceMid", record.device_mid()),
+                    (
+                        crate::server::core::providers::zcode::PLAN_FIELD,
+                        record.zcode_plan(),
+                    ),
+                ] {
+                    if !value.trim().is_empty() {
+                        object.insert(key.to_string(), Value::String(value));
+                    }
+                }
+            }
+        }
+        // ── Antigravity 的两个附加键（`antigravity::adapter` 用）──────
+        // 与上面 ZCode 同一手法、同一理由：适配器只能看到会话，而这两个字段
+        // 在记录里（`antigravity_accounts.rs` 的落盘形态）：
+        //   - `projectId`：cloudaicompanionProject —— 信封的 `project` 字段
+        //     （规格 §3.3），OAuth 刷新 / 添加账号 / 目录刷新三处发现后回写；
+        //   - `email`：决定信封的 `userAgent` 标记（非 gmail/googlemail →
+        //     `jetski`，Manager 的判定逐字）。会话里的 `account.uid` 对
+        //     Antigravity 也是 email，但那是「展示身份」的通用字段，别让
+        //     协议层去依赖通用字段的取值约定。
+        // 条件判据是 provider id（与 ZCode 的 Region 同一性质），对别家的会话
+        // 是逐字空操作（连键都不会多）。
+        if record.provider() == super::ANTIGRAVITY_PROVIDER_ID {
+            if let Some(object) = session.as_object_mut() {
+                for key in ["projectId", "email"] {
+                    let value = record
+                        .fields()
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .unwrap_or("");
+                    if !value.is_empty() {
+                        object.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                }
+            }
+        }
+        // ── OfficeAce 的凭据字段（`officeace::adapter` 用）──────────────
+        // 它的转发凭证不是 `auth.accessToken`，而是**记录顶层的**网关 Basic 那一对
+        // （`baseUrl` / `modelAppKey` / `modelAppSecret`）；控制面临时凭据
+        // （`accessKeyId` 等）留给额度/签到。会话是转发链交给适配器的唯一形态
+        // （`build_chat_request` 的 `account` 参数），所以这些字段必须随会话出来 ——
+        // 否则 `officeace::credentials::from_record` 读到全空、转发必报缺凭据。
+        // 与 ZCode 那支同一形态（本家才注入，别家逐字不变）；空值不写。
+        if record.provider() == crate::server::core::account_store::OFFICEACE_PROVIDER_ID {
+            if let Some(object) = session.as_object_mut() {
+                for key in [
+                    "baseUrl",
+                    "modelAppKey",
+                    "modelAppSecret",
+                    "accessKeyId",
+                    "secretAccessKey",
+                    "securityToken",
+                    "projectId",
+                ] {
+                    let value = record.get(key).and_then(Value::as_str).unwrap_or("");
+                    if !value.trim().is_empty() {
+                        object.insert(key.to_string(), Value::String(value.to_string()));
+                    }
+                }
+                if let Some(expires_at) = record
+                    .get("expiresAt")
+                    .and_then(Value::as_i64)
+                    .filter(|value| *value > 0)
+                {
+                    object.insert("expiresAt".to_string(), Value::from(expires_at));
+                }
+            }
+        }
+        session
     }
 
     /// 指定账号的凭证（Node 版 getCredentialsById）；无凭证/不存在时 None
@@ -549,7 +640,9 @@ impl AccountStore {
             return None;
         }
         let edition = resolve_edition(record.edition().as_deref());
-        let resolution = resolve_account_proxy(Some(&record.proxy()));
+        // 轮询档取**下一个**出口（游标属于「这条账号的出网进度」）：凭证读数是
+        // 一次真实的出网准备，与展示口径分开，见 `resolve_account_proxy_rotating`。
+        let resolution = resolve_account_proxy_rotating(Some(&record.proxy()), record.id());
         let (proxy, proxy_error) = split_resolution(resolution);
         Some(CredentialsById {
             id: record.id().to_string(),
@@ -572,13 +665,16 @@ impl AccountStore {
     }
 
     /// 指定账号的完整会话形态（Node 版 getSessionById）；不存在/无凭证时 None
+    ///
+    /// 代理走 `resolve_account_proxy_rotating`：转发的每一次选路都从这里取出口，
+    /// 轮询档因此天然是「一请求一出口」（见 `core::proxy_rotate` 的模块头）。
     pub fn get_session_by_id(&self, id: &str) -> Option<SessionById> {
         let _guard = self.guard();
         let record = self.record_by_id(&_guard, id)?;
         if !record.has_credentials() {
             return None;
         }
-        let resolution = resolve_account_proxy(Some(&record.proxy()));
+        let resolution = resolve_account_proxy_rotating(Some(&record.proxy()), record.id());
         let (proxy, proxy_error) = split_resolution(resolution);
         Some(SessionById {
             id: record.id().to_string(),
@@ -586,6 +682,28 @@ impl AccountStore {
             proxy,
             proxy_error,
         })
+    }
+
+    /// 轮询档的**下一个**出口（不带会话、只按配置取一条）。
+    ///
+    /// 消费方是转发层「429 原地换出口」那条补救：OpenCode Zen 免费档的 429 是
+    /// **按 IP** 判的（这个 IP 的免费额度用完），换一个出口往往就能过 ——
+    /// 换到别的 IP 再试一次比直接罚账号（按模型冷却）更贴近上游的语义。
+    ///
+    /// 返回 `Ok(None)` = 这条账号不是轮询档（调用方不该换出口）；
+    /// `Err(原因)` = 是轮询档但一条候选都取不出来（原因原样报给明细）。
+    pub fn next_rotate_proxy(&self, id: &str) -> Result<Option<ResolvedProxy>, String> {
+        let _guard = self.guard();
+        let Some(record) = self.record_by_id(&_guard, id) else {
+            return Ok(None);
+        };
+        let config = record.proxy();
+        if !crate::server::core::proxies::is_rotate_config(&config) {
+            return Ok(None);
+        }
+        crate::server::core::proxy_rotate::next(&config, record.id())
+            .map(Some)
+            .map_err(|reason| reason)
     }
 }
 
